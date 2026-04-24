@@ -11,13 +11,17 @@ browser_agent/
 ├── .devcontainer/
 │   └── devcontainer.json        # dockerComposeFile mode, attaches to `agent`
 ├── docker-compose.yml           # all services, agent-net network
-├── .env.example
+├── .env.example                 # template — copy to .env, fill in keys
+├── ARCHITECTURE.md               # topology + services + reviewer UI IA
+├── STARTUP_PROCESS.md            # boot + smoke + publish runbook
 ├── docs/
-│   └── MASTER_PLAN.md
+│   ├── MASTER_PLAN.md           # roadmap + progress table + forensic audit
+│   └── Architecture.txt         # agent-code visual (beginner-friendly)
 └── services/
-    ├── agent/                   # Mastra + Playwright MCP (Node 20, TS) — this dev container
+    ├── agent/                   # Mastra + Playwright MCP (Node 20, TS) — THIS dev container
     ├── rag/                     # FastAPI + Qdrant embedder (copied from docs_pipeline_311)
-    └── browser-viewer/          # socat + noVNC bridge (copied from agent_sidecar_311)
+    ├── test-webapp/             # Next.js 14 — reviewer UI + Playwright target
+    └── browser-viewer/          # socat + noVNC bridge (compose-wired but idle)
 ```
 
 ## Services (on `agent-net`)
@@ -25,9 +29,10 @@ browser_agent/
 | Service           | Role                                          | Host port(s)        | Internal DNS     |
 |-------------------|-----------------------------------------------|---------------------|------------------|
 | `agent`           | Mastra workflows + Playwright MCP + HTTP/WS   | `3001`, `9229`      | `agent`          |
+| `test-webapp`     | Reviewer UI (`/agent/review/[runId]`) + Playwright target | `3000`  | `test-webapp`    |
 | `rag`             | FastAPI embedder (e5-large-v2, 1024-dim)      | `3009`              | `rag`            |
 | `qdrant`          | Vector DB                                     | `6333`, `6334`      | `qdrant`         |
-| `postgres`        | Structured state (events, reviews, selectors) | `5432`              | `postgres`       |
+| `postgres`        | Structured state (events, reviews, runs)      | `5432`              | `postgres`       |
 | `browser-viewer`  | noVNC bridge → agent's Chromium over `:5900`  | `6080`              | `browser-viewer` |
 
 A `services-healthcheck` aggregator gates on `qdrant + postgres + rag` so tooling / CI has a single readiness signal.
@@ -45,13 +50,16 @@ Or use the dev container: **Reopen in Container** → VS Code attaches to `agent
 
 ## Ports exposed to the host
 
-- `http://localhost:3001` — agent HTTP/WS (coming in Week 1)
+- `http://localhost:3000` — test-webapp (reviewer UI at `/agent/review/[runId]` + Playwright target at `/login`, `/users`, ...)
+- `http://localhost:3001` — agent HTTP/WS (`POST /triage`, `GET /runs/:id`, `POST /runs/:id/review`, `WS /stream/:runId`, `GET /static/runs/:runId/:filename`)
 - `http://localhost:3009/monitor` — RAG status
-- `http://localhost:6080` — noVNC viewer (watch the agent's browser live)
+- `http://localhost:6080` — noVNC viewer (parked — browser-viewer service is idle by default)
 - `http://localhost:6333/dashboard` — Qdrant dashboard
 - `postgresql://agent:agent@localhost:5432/agent`
 
 ## Current status
+
+**Week 1B complete — 7b.iii.b series closed. 150/150 tests green, 16 test files, tsc clean. End-to-end two-gate human-in-the-loop workflow live.** Week 2 (skill cards + RAG wiring) not started.
 
 **Phase 0 — Infrastructure & RAG foundation: complete and end-to-end verified.**
 
@@ -104,16 +112,11 @@ Verification (last full-stack bring-up):
 - Both test-webapp routes return `HTTP 200`; agent container alive on Node 20.20.2
 - Reject-path orphan `tool.started` from Commit 2 dropped; timeline-span invariant restored
 
-Known follow-ups (tracked, not blocking Week 1B):
+All Week-1A follow-ups have since landed: next bumped to `14.2.35`, test-webapp lockfile committed, `destructive` regex replaced by LLM-declared + structured `PlanSchema.actions[]` in 7b.ii hotfixes, screenshot rendering live since Commit 6c.
 
-- Bump `services/test-webapp/package.json` `next` from `14.2.15` → `14.2.35` (same minor range; accumulates 14 CVE fixes). Run `npm install --save-exact next@14.2.35` then rebuild the container.
-- Add a lockfile to `services/test-webapp/` so the Dockerfile can use `npm ci` instead of `npm install` (reproducible builds).
-- The `plan` step still infers `destructive` from a substring regex — Week 2 replaces with skill-card declared properties.
-- No screenshot rendering in the reviewer UI Should test manually — ✅ landed in Commit 6c (see Week 1B below): `/static/runs/:runId/:filename` Hono route + Next.js `/api/static/...` rewrite + inline `<img>` thumbnails in the step-card timeline.
+### Week 1B ✅ complete
 
-### Week 1B — in progress
-
-Commits landed so far (exit criterion still pending Commits 6 + 7):
+Commits landed — the full chain from canned stubs to end-to-end human-in-the-loop agentic workflow:
 
 - **Commit 4 — test-webapp admin surface** ✅ (Next.js 14.2.35, `/login` + `/users` + `/users/:id/reset-password` + `/status`, seeded users with stable `data-testid` selectors, session-gated `(auth)` route group; reviewer UI at `/agent/review/[runId]` unchanged)
 - **Commit 5-prep — RAG response shape** ✅ (`query_model.qa_search_with_hits` + `deep_semantic_search_with_hits` add structured `hits[{id, score, text, source, chunk_id}]` alongside existing `docs[]`; back-compat wrappers preserve `List[str]` for the CLI configurator)
@@ -134,38 +137,28 @@ Commits landed in the 7a series (reviewer UX):
 - **Commit 7a.iv — implicit post-action screenshots** ✅ (agent-side only. `services/agent/src/mastra/tools/playwrightMcp.ts` wraps `session.click` and `session.fillForm` so after a successful MCP call returns, a follow-up `takeScreenshot("${mcpToolName}:after")` fires via a TDZ-safe closure-local `doTakeScreenshot()` helper that's shared with the public `takeScreenshot` method. Failures in the post-action hook become `logger.debug` — never poison a successful click. Bumps PNG count per happy-path run from 6 → ~12–15 and makes the behavior feed refresh at ~1 frame per user-visible browser action during `execute`. Test count 86 → **87** — existing `[8]` fillForm test amended for the +1 screenshot call, new `[12]` asserts the `:after` label convention and absolute-path filename contract.)
 - **Commit 7a.v — agentic polish (closes the 7a series)** ✅ (five interacting features landed together: (1) scroll-anchor upgrade — deleted `padding-bottom: 66vh`, added `.behavior-feed > * { scroll-margin-top: 33vh }`, replaced `scrollTop = scrollHeight` with `lastElementChild?.scrollIntoView({block: "start"})` so growing typewriter text fills downward from a stable anchor line regardless of frame height. (2) Typewriter on `llm.text.delta` — 60 cps fixed-rate char pump with catchup scaling when >50 chars behind the wire; flushes on `llm.message.completed`; blinking `▊` caret while streaming. (3) Thinking bubble fade — on `llm.message.completed`, the purple thinking block collapses to a pill `[Sonnet] thought for 7.2s · click to expand` via a CSS grid `1fr → 0fr` transition (200 ms); click-to-expand, click-"collapse" inside expanded to re-collapse. (4) Tool-card pulse — CSS `@keyframes toolPulse` emits a breathing accent-blue `box-shadow` around `.feed-tool.pending .marker` using `rgba(var(--accent-rgb), ...)` (the token added in 7a.iii earns its keep); stops automatically when the card flips to `.ok` / `.err`. (5) Active-step autoscroll in the LEFT column — on each new `step.started` transition, the matching `.step-outcome` row auto-scrolls into view with `block: "nearest"`; gated by the same 3 s-idle rule as the feed but with a separate `lastOutcomesInteractionAt` ref so interactions in one column don't bail the other.)
 
-Upcoming (7b-series scope revised after Commit 7a.v smoke uncovered an Anthropic 500 in `verify`):
+Commits landed in the 7b series (reliability + ReAct + Block 1 + two-gate human-in-the-loop):
 
-- **Commit 7a-docs-sync** ✅ (this commit — sync README / ARCHITECTURE §2.7 / STARTUP_PROCESS §1.6 / MASTER_PLAN to reflect the 7a-series landed state + the revised 7b scope).
-- **Commit 7b.i — circuit breaker + Anthropic wrap + listener fix** ⏳ (new reusable primitive at `services/agent/src/lib/circuit.ts`: named-instance registry, three-state machine (closed → open → half-open) with sliding failure window + cooldown + single-probe recovery, structured pager-ready `event: circuit_breaker.state_change` log trail, composed retry-on-5xx with exponential backoff inside `execute()`. First consumer: `services/agent/src/llm/streamMapper.ts` routes the Anthropic SDK streaming call through `getCircuit("anthropic")` — every `classify` / `plan` / `verify` call and every future ReAct iteration becomes resilient to transient API flake automatically. Second fix-in-flight: `setMaxListeners(32, opts.signal)` in `launchBrowser` to silence the `MaxListenersExceededWarning` that 7a.iv's denser screenshot cadence reliably trips. Target test count: 87 → ~97. No refactor of `rag.ts` (it already has its own `p-retry` setup) and no MCP-call wrapping (different failure mode, deferred).
-- **Commit 7b.ii — `createReActStep` runner + `retrieveStep` refactor** ⏳ (the original 7b scope, now landing on top of the hardened LLM layer. Reusable `createReActStep({ id, goal, tools, maxIterations })` Mastra step factory that runs a think → tool → observe → think loop using the existing `streamMessage` + existing tool wrappers. New envelope variants `react.iteration.started` + `react.iteration.completed` so the reviewer UI can render each iteration as a nested row under the parent step card. First application: `retrieveStep` goes from "fire two identical RAG queries blindly" to "look at the classification, decide what to actually ask, query, observe, re-query if hits are weak." Gates stay exactly where they are — ReAct just makes pre-gate reasoning richer and legible. See `docs/MASTER_PLAN.md` §4.1.
-- **Commit 7b-docs-sync** ⏳ (closes the 7b series; same 5c / 6c-4 / 7a-docs precedent — README / ARCHITECTURE / STARTUP_PROCESS / MASTER_PLAN sync after 7b.ii lands).
-- **Week 1B exit criterion (current):** `POST /triage` with a password-reset ticket produces an end-to-end **agentic-feeling** reviewer experience — visibly streaming ReAct iterations on `retrieve` (thought → RAG call → observation → next thought), every browser action during `execute` emits a screenshot that refreshes the behavior feed at ~1 Hz, thinking blocks fade to one-line summaries on completion with click-to-expand, typewriter reveals output text char-by-char, Jane's password actually resets, and transient Anthropic 500s no longer kill the run. Live VNC browser feed is **deliberately deferred** to a post-Week-5 stretch ("Commit 10c") — the behavior feed delivers ~95 % of the "watch the agent work" product value at ~5 % the infrastructure cost. `browser-viewer` service stays compose-wired but idle so reactivation is cheap if we ever need it.
+- **Commit 7a-docs-sync** ✅ (synced docs after the 7a series).
+- **Commit 7b.i — circuit breaker + Anthropic wrap + listener fix** ✅ (`services/agent/src/lib/circuit.ts` — named-instance registry, three-state machine closed/open/half-open with sliding failure window + cooldown + single-probe recovery, pager-ready `event: circuit_breaker.state_change` log trail. First consumer: `streamMapper.ts` routes every Anthropic SDK streaming call through `getCircuit("anthropic")`. Also lands `setMaxListeners(32, opts.signal)` in `launchBrowser`. Test count 87 → **98**.)
+- **Commit 7b.ii — `createReActStep` runner + `retrieveStep` refactor** ✅ (reusable `createReActStep({ id, goal, tools, maxIterations })` Mastra step factory at `src/mastra/lib/reactRunner.ts`. Two new envelope variants `react.iteration.started` / `react.iteration.completed` with optional `reactIterationId` tagging on every `llm.*` / `tool.*` / `rag.retrieved` / `browser.*` frame inside an iteration → reviewer UI nests them under a collapsible row. First application: `retrieveStep` now runs think → targeted RAG → observe → refine. Test count 98 → **110**.)
+- **Commit 7b.ii hotfixes 1-4** ✅ (ticket plumbed onto RunContext, `RetrievalSchema.hits` carries real preview text, structured `PlanSchema` with `actions[]` + LLM-declared `destructive` + `requiresContext` replaces regex heuristics, `z.preprocess(null → undefined)` on scalar schema fields. Dead code pruned. Test count 110 → **115**.)
+- **Commit 7b.iii.a — Block 1 iteration controller** ✅ (plain-TS orchestrator at `src/mastra/lib/blockController.ts` wrapping classify/retrieve/plan/dry_run in a pass loop with `BLOCK1_MAX_PASSES = 3`, observation carry-forward, new envelope variants `block.iteration.started` / `block.iteration.completed`, `BlockResultSchema` on `DryRunSchema.blockResult` for the exhausted path. Test count 115 → **130**.)
+- **Commit 7b.iii.b-bus-extension** ✅ (EventBus per-(runId, stepId) decision slots — unblocks the two-gate architecture. New `publishClientDecisionForStep` + `awaitDecisionForStep`; old `publishClientDecision` / `awaitDecision` preserved as back-compat shims defaulting `stepId = "review_gate"`. Slot-consumption state machine with pre-delivery + stale-discard + per-slot idempotency. `GateStepIdSchema = z.enum(["review_gate", "human_verify_gate"])` narrows the wire. Test count 135 → **141** (+6 scoped + 1 cross-slot idempotency regression guard).)
+- **Commit 7b.iii.b-pre-exec-refine + 2-hotfix-1** ✅ (`runReviewGateStep` refine loop — Edit with notes re-runs Block 1 with `seedObservations`, emits `block.backtrack.triggered { fromStep: "review_gate" }`, cap `MAX_PRE_GATE_REFINES = 2`. Hotfix-1 fixed Bug A Scope 1 — moved `dry_run` out of blockController's inner cognitive `withRunContext` spread because `runDryRunStep` mutates `ctx.browser` and the spread was trapping the mutation. Test count 141 → **148**.)
+- **Commit 7b.iii.b-pre-exec-edit-ui + hotfix-1 + amend-1 + hotfix-2** ✅ (reviewer UI ReviewPanel three-mode state machine — default / edit / submitting / escape hatch. Three follow-up hotfixes: hotfix-1 fixed memo-unmount-on-edit (Bug 1) + Playwright MCP profile-lock collision (Bug B); amend-1 narrowed the terminal guard to `run.completed` only (Bug 3A interaction); hotfix-2 threaded observations via `runBlock1(..., { seedObservations })` instead of a `withRunContext` spread, fixing Bug A at Scopes 2 + 3 (refine loop + parked humanVerifyGateStep). 148 unchanged.)
+- **Commit 7b.iii.b-human-verify-gate** ✅ (post-exec gate un-parked + inserted into workflow chain. Piece B synthetic `block1 step.started/completed` frames wrap every refine/backtrack `runBlock1` call → LEFT column reads latest via `findLast`. Piece C post-exec ReviewPanel variant (Reject + Approve only; Edit deliberately hidden — wedge-prevention rationale in docblock). Piece D `FeedBacktrackBanner` component with pre-exec / post-exec copy branches. Piece A.5 Bug 3A mitigation (drop `thinking` from `runPlanStep`'s step.completed.output — UI reads from `llm.thinking.delta` stream, never the step payload). Test count 148 → **150**. Smoke verified across 4 live UI runs: approve-only / edit-refine / post-exec-reject-backtrack / post-exec-budget-exhaust — all clean, Jane DB resets verified, all 4 forensic fingerprints zero.)
+- **Commit 7b.iii.b-docs-sync** ✅ (this commit — `runContext.ts` CTX SPREAD INVARIANT docblock + updated stale `priorObservations` comment; `MASTER_PLAN.md` progress table expansion + `### 7b.iii.b series — forensic audit` table (Bug A / B / 4 / 3A fingerprints with "Bug A hid Bug B hid Bug 4; Bug 3A orthogonal" causal narrative) + `### Week-2 polish queue` (11 tracked items); `ARCHITECTURE.md` §2.1 rewritten for 9-step + 2-gate reality; §2.7 for post-exec ReviewPanel variant + FeedBacktrackBanner + three-mode state + `findLast` LEFT-column refresh; `STARTUP_PROCESS.md` §1.6 header updated, new §1.6.5 Edit-refine walkthrough, §1.6.6 post-exec gate walkthrough, §1.6.7 forensic acceptance guards with SQL cross-checks. Plus new `docs/Architecture.txt` — 868-line agent-code-scoped visual + beginner primer. No code / no test changes. 150/150 unchanged.)
 
-Committed in Commit 1:
+**Week 1B exit criterion — met.** `POST /triage` with a password-reset ticket produces end-to-end two-gate human-in-the-loop agentic flow: visibly streaming ReAct iterations on retrieve, per-browser-action screenshots during execute/dry_run, thinking bubble fade + typewriter reveal, pre-exec Edit re-plans via refine loop, post-exec Reject triggers full backtrack via `block.backtrack.triggered { fromStep: "human_verify_gate" }`, both gates cap correctly, Jane's password actually resets (DB-verified), transient Anthropic 500s no longer kill runs. Live VNC browser feed deferred to post-Week-5 stretch ("Commit 10c").
 
-- [x] `services/agent/package.json`, `tsconfig.json`, `vitest.config.ts`, `drizzle.config.ts`, `.dockerignore`
-- [x] `src/env.ts` — Zod-validated env, fails loud at boot
-- [x] `src/logger.ts` — pino with API-key redaction
-- [x] `src/events/envelope.ts` — 24-variant Zod discriminated union, `MAX_FRAME_BYTES=16 KiB`, `seq: null` for transport frames
-- [x] `src/events/bus.ts` — per-run ring buffer, monotonic seq, idempotent decisions, synthetic `run.failed` on envelope violation, waiter ordering for Mastra suspend/resume bridge
-- [x] `src/events/stream.ts` — origin allowlist + hello-first handshake + log-and-continue ConflictError semantics
-- [x] `src/events/persist.ts` — append every frame to Postgres `events` table (fire-and-forget with error log)
-- [x] `src/db/{client,schema,migrate}.ts` + `migrations/0001_init.sql` — `runs`, `events`, `reviews` tables; `UNIQUE(idempotency_key)` enforced at the DB layer
-- [x] `src/index.ts` — Hono + `@hono/node-ws` + graceful shutdown
-- [x] `src/http/{health,triage,runs}.ts` — stubs; triage currently emits a canned `run.started → run.completed` so the pipe can be smoke-tested end-to-end without any LLM calls
-- [x] `test/{envelope,bus,origin}.test.ts` — 38 unit tests covering envelope parsing, bus behaviour, origin normalisation
-- [x] `.env.example` — `ANTHROPIC_API_KEY`, model pins, `SHARED_*_UUID` real values, `ALLOWED_WS_ORIGINS` with both `localhost` and `127.0.0.1` variants
+### Up next — Week 2
 
-Pending (Commit 2 + 3):
+Skill cards + RAG wiring. See [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md) — the Week-2 polish queue at the bottom of the progress table lists 11 specific tracked items (rag.ts→circuit-breaker unify, verifyStep hard-fail on stepsRun===0, planStep last-fence parser fix, `--warn-rgb` token, MaxListeners cleanup, env-var overrides for the backtrack caps, override-and-proceed on exhausted blockResult, etc.) plus the main scope: Zod skill-card schema at `src/schemas/skill-card.ts`, skill card + runbook YAML authoring under `kb/`, `scripts/embed-skill-cards.ts`, apply `createReActStep` to `classify` + `verify`, refactor hardcoded Jane reset flow → skill-card-driven executeStep.
 
-- [ ] `src/llm/` — Anthropic SDK pinned to a version supporting extended thinking, SSE → envelope stream mapper with proactive chunking
-- [ ] `src/mastra/` — Mastra instance, 8-step workflow, step emitter, tool wrappers for RAG + Playwright MCP
-- [ ] `http/triage.ts` replaces canned body with the real workflow
-- [ ] `services/test-webapp/` review page at `/agent/review/:runId`
-- [ ] Week 1B — real Playwright against `test-webapp` + one hardcoded skill
+**Exit criterion:** agent handles `reset_user_password` AND `unlock_account` with ZERO code changes between them — skill-card lookup alone.
 
 ### Action items outstanding
 
-- [ ] **Rotate the Hugging Face token** that was previously committed to `.env.example` as a literal value. Token is now scrubbed in the file but sat on disk in cleartext; revoke on HF Settings → Access Tokens before the folder is ever `git init`'d or shared.
-- [ ] Week 2+ — see [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md)
+- [ ] **Rotate the Hugging Face token** that was previously committed to `.env.example` as a literal value. Token is now scrubbed in the file but sat on disk in cleartext; revoke on HF Settings → Access Tokens before the folder is ever pushed publicly.
+- [ ] Week 2+ — see [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md) for the full progress table, forensic audit, and polish queue.
