@@ -407,8 +407,36 @@ describe("envelope — client frames", () => {
     expect(res.success).toBe(true);
   });
 
+  it("parses a review.decide with the Week-2a 'terminate' decision (4-decision HIL model)", () => {
+    // Week-2a gate-decision-model — wire-contract guard: the client
+    // frame schema must accept all 4 values of the decision enum.
+    // The server's ReviewDecidedFrame enum mirrors this. Adding a
+    // new value to one schema without the other would desync the
+    // wire; this test and its server-side companion guard against
+    // that drift.
+    const res = clientFrameSchema.safeParse({
+      type: "review.decide",
+      decision: "terminate",
+      stepId: "review_gate",
+      idempotencyKey: "33333333-3333-4333-8333-333333333333",
+    });
+    expect(res.success).toBe(true);
+  });
+
   it("rejects an unknown client frame type", () => {
     const res = clientFrameSchema.safeParse({ type: "something.else" });
+    expect(res.success).toBe(false);
+  });
+
+  it("rejects a review.decide with a decision value outside the 4-value enum", () => {
+    // Week-2a gate-decision-model — guards against wire drift. If a
+    // 5th decision is added to the schema, this test must be updated
+    // (and ReviewDecidedFrame / bus.ts / stream.ts / runs.ts /
+    // schema.ts + migration all need a matching widening).
+    const res = clientFrameSchema.safeParse({
+      type: "review.decide",
+      decision: "abandon", // not in enum
+    });
     expect(res.success).toBe(false);
   });
 });

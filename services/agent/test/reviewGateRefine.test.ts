@@ -144,8 +144,17 @@ describe("runReviewGateStep — pre-exec edit-refine loop (7b.iii.b commit 2)", 
     bus = new EventBus({ ringBufferSize: 256 });
   });
 
-  it("[1] approve/reject at slot 0 returns without invoking Block 1", async () => {
-    for (const d of ["approve", "reject"] as const) {
+  it("[1] approve/terminate at slot 0 returns without invoking Block 1", async () => {
+    // Week-2a gate-decision-model — `reject` was the second
+    // sub-case here pre-week2a (when reject was the skip-cascade
+    // mechanism today's `terminate` uses). Under the 4-decision
+    // model reject now routes through the refine loop, so its
+    // skip-cascade slot is filled by the new `terminate` decision.
+    // Test semantics preserved: both approve and terminate are
+    // slot-0 short-circuits that return directly without invoking
+    // runBlock1. Reject's new refine behavior is covered by test
+    // [7] below.
+    for (const d of ["approve", "terminate"] as const) {
       const { fn: stub, invocations } = makeBlock1Stub([]);
       await withRunContext(
         { runId: RUN_ID, bus, ticket: { ticketId: "T1", subject: "s" } },
@@ -264,10 +273,13 @@ describe("runReviewGateStep — pre-exec edit-refine loop (7b.iii.b commit 2)", 
         }
 
         const res = await p;
-        // Cap-trip converts the 3rd edit into a synthetic reject —
-        // flows through the existing reject path (executeStep skipped
-        // → verifyStep skipped → logAndNotifyStep status=rejected).
-        expect(res.decision).toBe("reject");
+        // Week-2a gate-decision-model — cap-trip converts the 3rd
+        // edit into a synthetic TERMINATE (not "reject" as pre-
+        // week2a). Flows through the same skip cascade
+        // (executeStep.skipped → verifyStep.skipped →
+        // logAndNotifyStep status=rejected) the pre-week2a "reject"
+        // mechanism used; only the decision value changed.
+        expect(res.decision).toBe("terminate");
         expect(res.approved).toBe(false);
         // refine #1 + refine #2 ran, but the 3rd edit tripped the cap
         // BEFORE invoking Block 1 a 3rd time.
@@ -448,5 +460,106 @@ describe("runReviewGateStep — pre-exec edit-refine loop (7b.iii.b commit 2)", 
     // B.4 — refined planId distinct from FAKE_DRY_RUN.plan.planId
     // (authoritative LEFT-column refresh signal).
     expect(completed[0]?.planId).not.toBe(FAKE_PLAN.planId);
+  });
+
+  it("[7] reject-no-notes enters refine loop with prescriptive seed observation (Week-2a gate-decision-model)", async () => {
+    // Week-2a gate-decision-model — under the 4-decision HIL model
+    // reject = "replan without notes" (NOT terminate). Routes
+    // through the same refine loop as edit, but with a different
+    // seed observation: the edit-without-notes fallback is mildly
+    // descriptive ("retry without specific notes") while reject-
+    // without-notes is prescriptive ("try a fundamentally different
+    // approach — different skill card, different action sequence,
+    // or different assumption").
+    //
+    // This test guards:
+    //   - reject triggers refine (not terminate) → runBlock1 runs
+    //   - the prescriptive copy reaches runBlock1's
+    //     seedObservations (= reviewer intent flows to Sonnet)
+    //   - subsequent approve still converges happily
+    const { fn: stub, invocations } = makeBlock1Stub([HAPPY_BLOCK1_RESULT]);
+    await withRunContext(
+      { runId: RUN_ID, bus, ticket: { ticketId: "T7", subject: "s" } },
+      async () => {
+        const p = runReviewGateStep(FAKE_DRY_RUN, { runBlock1Fn: stub });
+
+        await yieldMicrotasks();
+        bus.publishClientDecisionForStep(RUN_ID, "review_gate", {
+          decision: "reject", // reject-no-notes — new semantic
+          by: "alice",
+          at: "2026-04-24T00:00:00.000Z",
+          idempotencyKey: "00000000-0000-4000-8000-000000000701",
+          // no patch.notes — this is the reject-no-notes path
+        });
+        await yieldMicrotasks();
+        bus.publishClientDecisionForStep(RUN_ID, "review_gate", {
+          decision: "approve",
+          by: "alice",
+          at: "2026-04-24T00:00:10.000Z",
+          idempotencyKey: "00000000-0000-4000-8000-000000000702",
+        });
+
+        const res = await p;
+        expect(res.decision).toBe("approve");
+        expect(invocations.length).toBe(1); // refine ran → Block 1 invoked
+        // Prescriptive reject-no-notes seed (NOT the edit-without-
+        // notes fallback "retry without specific notes").
+        expect(invocations[0]?.seedObservations?.[0]).toMatch(
+          /rejected the prior plan without notes/,
+        );
+        expect(invocations[0]?.seedObservations?.[0]).toMatch(
+          /fundamentally different approach/,
+        );
+      },
+    );
+  });
+
+  it("[8] terminate short-circuits — no refine, returns approved=false for skip cascade (Week-2a gate-decision-model)", async () => {
+    // Week-2a gate-decision-model — terminate is the wire-level
+    // kill. Returns decision="terminate" + approved=false without
+    // entering the refine loop (Block 1 NOT invoked). The
+    // approved=false flag flows into executeStep.skipped →
+    // verifyStep.skipped → logAndNotifyStep status=rejected via
+    // the same skip cascade the pre-week2a "reject" path used.
+    //
+    // Guards:
+    //   - terminate does NOT trigger runBlock1 (invocations.length === 0)
+    //   - return shape is { decision: "terminate", approved: false }
+    //   - no block.backtrack.triggered frame emitted (the refine
+    //     loop is the only emitter; terminate short-circuits before
+    //     reaching it)
+    const { fn: stub, invocations } = makeBlock1Stub([]);
+
+    const backtrackFrames: Array<{ fromStep: string }> = [];
+    bus.subscribe(RUN_ID, (f) => {
+      if (f.type === "block.backtrack.triggered") {
+        backtrackFrames.push({ fromStep: f.fromStep });
+      }
+    });
+
+    await withRunContext(
+      { runId: RUN_ID, bus, ticket: { ticketId: "T8", subject: "s" } },
+      async () => {
+        const p = runReviewGateStep(FAKE_DRY_RUN, { runBlock1Fn: stub });
+
+        await yieldMicrotasks();
+        bus.publishClientDecisionForStep(RUN_ID, "review_gate", {
+          decision: "terminate",
+          by: "alice",
+          at: "2026-04-24T00:00:00.000Z",
+          idempotencyKey: "00000000-0000-4000-8000-000000000801",
+        });
+
+        const res = await p;
+        expect(res.decision).toBe("terminate");
+        expect(res.approved).toBe(false);
+        expect(invocations.length).toBe(0); // NO refine — short-circuit
+      },
+    );
+
+    // NO block.backtrack.triggered — terminate is NOT a backtrack.
+    // The pre-week2a "reject" path emitted zero of these too (reject
+    // was a skip-cascade, not a refine), so this is consistent.
+    expect(backtrackFrames.length).toBe(0);
   });
 });

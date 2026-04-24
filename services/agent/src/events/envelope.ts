@@ -342,7 +342,21 @@ const ReviewRequestedFrame = timelineHeader.extend({
 
 const ReviewDecidedFrame = timelineHeader.extend({
   type: z.literal("review.decided"),
-  decision: z.enum(["approve", "reject", "edit"]),
+  // Week-2a gate-decision-model — 4-decision HIL semantics:
+  //   approve   — "proceed with this plan" → execute → verify → post-exec
+  //   reject    — "this plan is wrong, try again (no specific guidance)"
+  //               → pre-exec: enters refine loop with auto-generated
+  //               seed observation; post-exec: triggers backtrack loop
+  //   edit      — "this plan is wrong, here's HOW to try again"
+  //               → refine loop with reviewer's patch.notes threaded in
+  //               (pre-exec only; post-exec treats edit ≡ approve per
+  //               the humanVerifyGateStep wedge-prevention docblock)
+  //   terminate — "stop this run entirely, don't replan"
+  //               → skip cascade (executeStep.skipped → verifyStep
+  //               .skipped → logAndNotifyStep status=rejected); the
+  //               same proven mechanism today's pre-exec "reject"
+  //               used pre-week2a (repurposed under the clearer name).
+  decision: z.enum(["approve", "reject", "edit", "terminate"]),
   by: z.string().min(1),
   at: z.string().datetime({ offset: true }),
   patch: PlanPatchSchema.optional(),
@@ -568,7 +582,11 @@ export const clientFrameSchema = z.discriminatedUnion("type", [
      *  (`GateStepIdSchema`) so the bus can't be pushed to open a
      *  gate slot for a non-gate stepId. */
     stepId: GateStepIdSchema.optional(),
-    decision: z.enum(["approve", "reject", "edit"]),
+    // Week-2a gate-decision-model — 4-decision HIL semantics.
+    // Mirrors ReviewDecidedFrame.decision above (server's outbound
+    // enum); kept in lockstep so a decision the client sends is
+    // never a value the server couldn't emit.
+    decision: z.enum(["approve", "reject", "edit", "terminate"]),
     patch: PlanPatchSchema.optional(),
     idempotencyKey: z.string().uuid().optional(),
   }),

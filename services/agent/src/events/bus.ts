@@ -57,7 +57,9 @@ export interface PublishTransportInput {
 }
 
 export interface ReviewDecision {
-  decision: "approve" | "reject" | "edit";
+  // Week-2a gate-decision-model — mirrors envelope.ts ReviewDecidedFrame
+  // and clientFrameSchema. See those for semantic definitions.
+  decision: "approve" | "reject" | "edit" | "terminate";
   by: string;
   at: string;
   idempotencyKey?: string;

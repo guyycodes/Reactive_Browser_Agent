@@ -125,7 +125,10 @@ export function openStream(deps: OpenStreamDeps): StreamSession {
   };
 
   const handleReviewDecide = (msg: {
-    decision: "approve" | "reject" | "edit";
+    // Week-2a gate-decision-model — mirrors clientFrameSchema in
+    // envelope.ts. See the schema docblock there for 4-decision
+    // semantic definitions.
+    decision: "approve" | "reject" | "edit" | "terminate";
     /** 7b.iii.b — which gate's slot this decision targets. Server
      *  defaults to "review_gate" for back-compat with pre-7b.iii.b
      *  clients that don't send the field. */

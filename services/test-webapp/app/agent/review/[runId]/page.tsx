@@ -45,7 +45,15 @@ const STEP_IDS = [
 // step.started/completed frames never render as a LEFT-column row.
 // block.iteration.* frames render only in the RIGHT feed as
 // FeedBlockDividerView items. Per the invariant in blockController.ts.
-type StepId = (typeof STEP_IDS)[number] | "agent" | "block1";
+//
+// Week-2a ux-polish — "human_verify_gate" added to the type union
+// (but NOT to STEP_IDS; there's no LEFT-column row for it — the
+// post-exec gate's decision surface is the ChatBar, not a step card).
+// Inclusion here is required so STEP_LABELS' Record<StepId, string>
+// can carry the display label for RIGHT-column feed dividers on
+// human_verify_gate frames (fixes the UNDEFINED · XXXXMS bug surfaced
+// during P3 smoke).
+type StepId = (typeof STEP_IDS)[number] | "agent" | "block1" | "human_verify_gate";
 type StepStatus = "pending" | "running" | "awaiting" | "completed" | "failed";
 
 interface Frame {
@@ -96,6 +104,29 @@ const REVIEW_EDIT_NOTES_MAX = 2000;
  *  issue (the gate itself enforces via the agent const). */
 const MAX_BACKTRACKS_UI = 2;
 
+/** Week-2a gate-decision-model — the set of review decisions that
+ *  DO NOT close the gate (they trigger a refine / backtrack that
+ *  emits a fresh review.requested). Used by the pendingReview memo
+ *  below to decide whether a `review.decided` frame should unmount
+ *  the ChatBar's decision-required mode or keep it open waiting
+ *  for the next fresh gate.
+ *
+ *  Decisions that close the gate (and therefore are NOT in this set):
+ *    - approve   — flows to execute / verify / post-exec
+ *    - terminate — skip cascade to run.completed{status=rejected}
+ *
+ *  Module-scope (not inside the memo's closure) for referential
+ *  stability across re-renders. Adding a future 5th decision
+ *  variant? One-line edit to this set. */
+const REFINE_TRIGGERS: ReadonlySet<string> = new Set(["reject", "edit"]);
+
+/** Week-2a gate-decision-model — Terminate confirmation window.
+ *  Single click on the Terminate link arms a pending state; second
+ *  click within TERMINATE_CONFIRM_MS commits. Matches the project's
+ *  3_000 idle-gesture convention (stick-to-bottom autoscroll grace,
+ *  active-step autoscroll grace). Cleanup via useEffect return. */
+const TERMINATE_CONFIRM_MS = 3_000;
+
 type ConnStatus = "connecting" | "open" | "closed" | "error";
 
 const STEP_LABELS: Record<StepId, string> = {
@@ -107,6 +138,13 @@ const STEP_LABELS: Record<StepId, string> = {
   review_gate: "review_gate",
   execute: "execute",
   verify: "verify",
+  // Week-2a ux-polish — missing entry caused "UNDEFINED · XXXXMS" in
+  // RIGHT-column step dividers on every post-exec run (the envelope
+  // schema added human_verify_gate to StepIdSchema in 7b.iii.b
+  // commit 4, but this map was never extended). Snake-case matches
+  // the other multi-word stepIds (review_gate / dry_run /
+  // log_and_notify) so SQL queries + smoke-recipe references line up.
+  human_verify_gate: "human_verify_gate",
   log_and_notify: "log_and_notify",
   block1: "block 1",
 };
@@ -344,9 +382,20 @@ export default function ReviewPage() {
     const lastDecision = decisions[decisions.length - 1] as
       | (Frame & { decision?: string })
       | undefined;
-    const lastIsEdit = lastDecision?.decision === "edit";
 
-    if (!lastIsEdit && decisions.length >= reqs.length) return null;
+    // Week-2a gate-decision-model — set-based trigger check replaces
+    // the prior single-value `lastIsEdit` conditional. Reject now
+    // ALSO keeps the panel mounted (routes through the refine loop
+    // → fresh review.requested with new planId), same as edit. The
+    // REFINE_TRIGGERS module-scope set is the single source of
+    // truth; add/remove decisions from it as the 4-decision model
+    // evolves.
+    const lastDecisionValue = lastDecision?.decision;
+    const lastTriggersRefine =
+      typeof lastDecisionValue === "string" &&
+      REFINE_TRIGGERS.has(lastDecisionValue);
+
+    if (!lastTriggersRefine && decisions.length >= reqs.length) return null;
     return (reqs[reqs.length - 1] as ReviewRequestedFrame) ?? null;
   }, [frames]);
 
@@ -355,9 +404,13 @@ export default function ReviewPage() {
   // (commit 1's per-stepId decision API); defaults to "review_gate"
   // server-side when absent. `opts.notes` rides PlanPatchSchema.notes
   // on decision="edit" to trigger Block 1's pre-exec refine loop.
+  //
+  // Week-2a gate-decision-model — "terminate" added to the union
+  // for the ChatBar's new Terminate affordance. Wire shape unchanged;
+  // only the decision string widens.
   const decide = useCallback(
     (
-      decision: "approve" | "reject" | "edit",
+      decision: "approve" | "reject" | "edit" | "terminate",
       opts?: { notes?: string; stepId?: string },
     ) => {
       const ws = wsRef.current;
@@ -399,23 +452,40 @@ export default function ReviewPage() {
           className="review-outcomes-col"
           role="region"
           aria-label="step outcomes"
-          tabIndex={0}
-          onScroll={onOutcomesScroll}
         >
-          {STEP_IDS.map((id) => {
-            const bucket = byStep.get(id) ?? { frames: [], status: "pending" as StepStatus };
-            return (
-              <StepOutcome
-                key={id}
-                stepId={id}
-                status={bucket.status}
-                frames={bucket.frames}
-                outcomeRef={(el) => {
-                  outcomeRefs.current[id] = el;
-                }}
-              />
-            );
-          })}
+          {/*
+            Week-2a — ChatBar UX refactor. The LEFT column becomes a
+            flex-column with a scrollable inner div (StepOutcome rows)
+            and a bottom-pinned ChatBar. The scroll handler + tabIndex
+            move to the inner div (that's now the scrolling element);
+            the aside remains the semantic region wrapper for a11y.
+          */}
+          <div
+            className="review-outcomes-scroll"
+            tabIndex={0}
+            onScroll={onOutcomesScroll}
+          >
+            {STEP_IDS.map((id) => {
+              const bucket = byStep.get(id) ?? { frames: [], status: "pending" as StepStatus };
+              return (
+                <StepOutcome
+                  key={id}
+                  stepId={id}
+                  status={bucket.status}
+                  frames={bucket.frames}
+                  outcomeRef={(el) => {
+                    outcomeRefs.current[id] = el;
+                  }}
+                />
+              );
+            })}
+          </div>
+          <ChatBar
+            pendingReview={pendingReview}
+            frames={frames}
+            onDecide={decide}
+            disabled={connStatus !== "open"}
+          />
         </aside>
         <div
           className="review-divider"
@@ -439,27 +509,6 @@ export default function ReviewPage() {
           <BehaviorFeed frames={frames} runId={runId} />
         </aside>
       </div>
-
-      {pendingReview && (
-        <ReviewPanel
-          onApprove={() => decide("approve", { stepId: pendingReview.stepId })}
-          onReject={() => decide("reject", { stepId: pendingReview.stepId })}
-          onEdit={(notes) =>
-            decide("edit", { notes, stepId: pendingReview.stepId })
-          }
-          request={pendingReview}
-          disabled={connStatus !== "open"}
-        />
-      )}
-
-      {!pendingReview && frames.some((f) => f.type === "review.decided") && (
-        <div className="review-panel decided">
-          <div className="review-info">
-            <h3>Review decided</h3>
-            <p>{describeDecision(frames)} — no further action needed.</p>
-          </div>
-        </div>
-      )}
     </main>
   );
 }
@@ -1067,17 +1116,49 @@ function BehaviorFeed({ frames, runId }: { frames: Frame[]; runId: string }) {
     if (!el) return;
     const shouldAutoScroll =
       stuckToBottomRef.current || Date.now() - lastUserScrollAt.current > 3_000;
-    if (shouldAutoScroll) {
-      // Commit 7a.v — scroll anchor: call scrollIntoView on the last DOM
-      // child rather than mutating scrollTop to scrollHeight. Combined
-      // with `.behavior-feed > * { scroll-margin-top: 33vh }` in CSS,
-      // the newest feed item anchors at ~1/3 from viewport top —
-      // deterministic regardless of frame height, so typewriter-growing
-      // bubbles fill downward from a stable anchor point instead of
-      // drifting below the fold.
-      const last = el.lastElementChild;
-      if (last) last.scrollIntoView({ block: "start", behavior: "auto" });
-    }
+    if (!shouldAutoScroll) return;
+    const last = el.lastElementChild;
+    if (!last) return;
+    // Week-2a ux-polish — scroll anchor is state-dependent:
+    //   • default (7a.v) — `scrollIntoView({ block: "start" })` parks
+    //     the last feed item's TOP at `scroll-margin-top: 33vh`.
+    //     Ideal for short frames (browser.nav, tool.completed) that
+    //     finish close to their starting height.
+    //   • streaming bubble (Week-2a) — if the last item is a bubble
+    //     whose thinking or text block is actively streaming, anchor
+    //     its BOTTOM to the viewport bottom so the growing caret /
+    //     tail stays visible instead of drifting below the fold.
+    //
+    // Streaming detection is done in JS (NOT via a CSS `:not()`
+    // selector) with two `querySelector` calls:
+    //   • text stream — `.text-block.typing` is present (the 7a.v
+    //     typewriter marker; class drops on `llm.message.completed`).
+    //   • thinking stream — `.thinking-block` is present AND its
+    //     enclosing `.thinking-wrapper` does NOT carry `.collapsed`
+    //     (the wrapper flips to `.collapsed` on
+    //     `llm.message.completed` via the 7a.v fade-to-summary
+    //     transition). Both end-conditions align on the same
+    //     lifecycle boundary, so the bottom-anchor auto-reverts to
+    //     top-anchor at stream end without any explicit transition
+    //     state.
+    //
+    // `scroll-margin-bottom: 12vh` (added on `.behavior-feed > *` in
+    // globals.css) gives the caret breathing room when the
+    // bottom-anchor path fires.
+    // Three-const extraction of the streaming-detection selectors
+    // (readability refactor from week2a-chatbar-ux-fix probe investigation;
+    // semantics identical to the original inline ternary). Naming the
+    // individual checks makes the compound boolean easier to reason
+    // about during future scroll-anchor tweaks — see MASTER_PLAN
+    // Week-2 polish queue: "thinking-scroll perfect-pin math".
+    const hasTextTyping = last.querySelector(".text-block.typing") !== null;
+    const hasThinkingBlock = last.querySelector(".thinking-block") !== null;
+    const hasCollapsed = last.querySelector(".thinking-wrapper.collapsed") !== null;
+    const isStreamingBubble = hasTextTyping || (hasThinkingBlock && !hasCollapsed);
+    last.scrollIntoView({
+      block: isStreamingBubble ? "end" : "start",
+      behavior: "auto",
+    });
   }, [frames.length]);
 
   return (
@@ -1522,317 +1603,419 @@ function FeedConsole({ item }: { item: Extract<FeedItem, { kind: "console" }> })
   return <div className={`feed-console ${level}`}>[{level}] {short(text, 200)}</div>;
 }
 
-/* ---------- ReviewPanel (7b.iii.b-pre-exec-edit-ui — adds Edit path) ---------- */
-
-function ReviewPanel(props: {
-  onApprove: () => void;
-  onReject: () => void;
-  /** 7b.iii.b-pre-exec-edit-ui — commit 2's pre-exec refine loop
-   *  consumes `patch.notes` from a decision=edit and re-runs Block 1
-   *  with the reviewer's note threaded into `priorObservations`.
-   *  ReviewPanel now exposes this as a textarea flow gated by an
-   *  explicit Edit button. */
-  onEdit: (notes: string) => void;
-  request: ReviewRequestedFrame;
+/* ---------- ChatBar (Week-2a — Jakob's-Law persistent decision surface) ----------
+ *
+ * Replaces the legacy <ReviewPanel>. Persistent, always-mounted input surface
+ * pinned to the bottom of the LEFT column (inherits `--left-pct` via its flex
+ * container). Visible regardless of gate state; mode-derived styling
+ * communicates whether reviewer input is required, the agent is working, or
+ * the run is terminal.
+ *
+ * Wire contract UNCHANGED: every decision still round-trips as a
+ * `review.decide` client frame via the parent's `decide()` callback. Server
+ * emits `review.decided` / `review.requested` / `run.completed` unchanged.
+ * Zero envelope additions, zero agent-side code changes, zero tests changed
+ * (UI-smoke-gated per 6b / 7a / commit-3 precedent).
+ *
+ * Mode machine (priority: terminal > submitting > decision-required > idle):
+ *   - idle                          : no pendingReview, run still live
+ *   - decision-required.pre_exec    : review.requested{pre_exec} pending;
+ *                                     Approve / Edit / Reject visible
+ *                                     (sub-state `.exhausted` disables Approve)
+ *   - decision-required.post_exec   : review.requested{post_exec} pending;
+ *                                     Approve / Reject only (Edit hidden —
+ *                                     wedge prevention, see allowEdit docblock)
+ *   - submitting                    : local state while Block 1 re-runs on Edit;
+ *                                     exits on fresh review.requested via
+ *                                     planId-delta effect (E4)
+ *   - terminal                      : run.completed received; all controls
+ *                                     disabled, summary line shown
+ *
+ * Cmd/Ctrl+Enter (non-empty note + decision-required + allowEdit) fires
+ * Edit; silent no-op otherwise. Approve / Reject require explicit click
+ * (destructive-action deliberation discipline; asymmetric by design).
+ * See Artifact 5 of the week2a-chatbar proposal for the handler contract.
+ *
+ * PRESERVED FROM REVIEWPANEL VERBATIM:
+ *   - submittedAtPlanId state + planId-delta useEffect (migrated from
+ *     ReviewPanel scope; same state names, same deps, same clear logic)
+ *   - Cancel-refine escape hatch (copy + "UI-only reset" caveat unchanged)
+ *   - Exhausted-state Approve disable + same title tooltip
+ *   - Post-exec Edit hiding + wedge-prevention docblock on allowEdit
+ *   - 2000-char maxLength on textarea (REVIEW_EDIT_NOTES_MAX)
+ */
+function ChatBar(props: {
+  pendingReview: ReviewRequestedFrame | null;
+  frames: Frame[];
+  onDecide: (
+    decision: "approve" | "reject" | "edit" | "terminate",
+    opts?: { notes?: string; stepId?: string },
+  ) => void;
   disabled: boolean;
 }) {
-  type PanelMode = "default" | "edit" | "submitting";
-  const [mode, setMode] = useState<PanelMode>("default");
-  const [notes, setNotes] = useState("");
+  const [note, setNote] = useState("");
+  // Week-2a gate-decision-model — Terminate two-step confirmation.
+  // `null` = link in default state; `number` (timestamp) = armed,
+  // awaiting second click within TERMINATE_CONFIRM_MS. A useEffect
+  // below cleans up the arm-timeout on unmount (prevents stale
+  // state-setters) and resets the flag if the reviewer doesn't
+  // double-click within the window.
+  const [terminateArmedAt, setTerminateArmedAt] = useState<number | null>(
+    null,
+  );
   /** 7b.iii.b-pre-exec-edit-ui — planId of the review.requested that
    *  was showing when the reviewer submitted an Edit. Used to detect
    *  the server's response — a fresh review.requested with a new
    *  planId means Block 1 finished re-planning and it's safe to
-   *  re-enable the panel. Closes the double-submit window during the
-   *  ~2-5 minute Block-1 re-run. */
+   *  re-enable the bar. Closes the double-submit window during the
+   *  ~2-5 minute Block-1 re-run.
+   *
+   *  (Week-2a: migrated from ReviewPanel scope verbatim — same state
+   *  name, same semantics. The planId-delta effect below is the E4
+   *  edge on the ChatBar state-transition diagram.) */
   const [submittedAtPlanId, setSubmittedAtPlanId] = useState<string | null>(null);
 
-  const actionCount = props.request.plan.actionCount ?? 0;
-  const destructive = props.request.plan.destructive ?? false;
-  const currentPlanId = props.request.plan.planId;
+  const isRunTerminal = useMemo(
+    () => props.frames.some((f) => f.type === "run.completed"),
+    [props.frames],
+  );
+
+  const currentPlanId = props.pendingReview?.plan.planId ?? null;
+  const isSubmitting = submittedAtPlanId !== null;
 
   // Auto-exit submitting mode when a fresh review.requested arrives
-  // (detected by planId delta). Defensive reset clears all edit-mode
-  // state so a subsequent Edit click starts from a clean slate.
+  // (detected by planId delta). Defensive reset clears note state so
+  // a subsequent Edit click starts from a clean slate.
+  //
+  // (Week-2a: migrated from ReviewPanel's `useEffect` at the old
+  // page.tsx:1557-1567. Mode is now derived rather than stateful, so
+  // the `setMode("default")` line has no analog — exiting submitting
+  // is just "clear submittedAtPlanId". Equivalent behavior.)
   useEffect(() => {
     if (
-      mode === "submitting" &&
+      isSubmitting &&
       submittedAtPlanId &&
       currentPlanId !== submittedAtPlanId
     ) {
-      setMode("default");
       setSubmittedAtPlanId(null);
-      setNotes("");
+      setNote("");
     }
-  }, [mode, submittedAtPlanId, currentPlanId]);
+  }, [isSubmitting, submittedAtPlanId, currentPlanId]);
 
-  // Commit 7b.iii.a — exhausted-passes path. When the Block 1
-  // controller hit its BLOCK1_MAX_PASSES cap without producing a
-  // viable plan, the review.requested frame carries a populated
-  // `blockResult` field. UI renders a distinct "exhausted" banner
-  // with the per-pass reasons + disables the approve button.
-  //
-  // 7b.iii.b-pre-exec-edit-ui — Edit is NOT offered on the exhausted
-  // path: Block 1 already spent its internal 3-pass budget, so
-  // soliciting reviewer notes would just trip the refine-loop budget
-  // with the same upstream cause. Reject-only remains correct here;
-  // override-and-proceed is Week-2 polish.
-  const blockResult = props.request.blockResult;
+  // Week-2a gate-decision-model — Terminate armed-state auto-reset.
+  // If the reviewer clicks Terminate but doesn't confirm within
+  // TERMINATE_CONFIRM_MS, revert to the unarmed link state silently
+  // (no toast, no shake — matches the Cmd+Enter silent-no-op
+  // discipline). Cleanup on unmount via return function prevents
+  // stale state-setters firing on an unmounted component.
+  useEffect(() => {
+    if (terminateArmedAt === null) return;
+    const t = setTimeout(
+      () => setTerminateArmedAt(null),
+      TERMINATE_CONFIRM_MS,
+    );
+    return () => clearTimeout(t);
+  }, [terminateArmedAt]);
+
+  // Sub-state derivations (match today's ReviewPanel exactly).
+  const isPostExec = props.pendingReview?.reviewHint === "post_exec";
+  const blockResult = props.pendingReview?.blockResult;
   const isExhausted = blockResult?.passedLast === false;
 
-  if (isExhausted) {
-    const passes = blockResult?.passes ?? 0;
-    const reasons = Array.isArray(blockResult?.allReasons)
+  // Mode derivation (priority order).
+  type ChatBarMode = "idle" | "decision-required" | "submitting" | "terminal";
+  const mode: ChatBarMode = isRunTerminal
+    ? "terminal"
+    : isSubmitting
+      ? "submitting"
+      : props.pendingReview
+        ? "decision-required"
+        : "idle";
+
+  // canDecide: can the reviewer submit any of the non-terminate
+  //   decisions (approve / reject / edit) right now?
+  //   WS open AND we're in decision-required mode.
+  //   Week-2a gate-decision-model — Terminate is deliberately NOT
+  //   gated by this; it has its own canTerminate guard below that
+  //   widens to the submitting state. Do NOT widen canDecide to
+  //   include submitting — that would accidentally re-enable the
+  //   Approve / Edit / Reject buttons in submitting mode and break
+  //   the existing planId-delta auto-exit discipline.
+  const canDecide = mode === "decision-required" && !props.disabled;
+
+  // Week-2a gate-decision-model — Terminate is reachable from
+  // BOTH decision-required AND submitting states (per hard
+  // requirement from the ux-polish review round). Rationale: if
+  // the server-side refine wedges (Block 1 hangs, Anthropic
+  // circuit-open cascade, etc.) the reviewer needs a wire-level
+  // kill. Cancel-refine is a UI-only unlock that doesn't stop the
+  // agent; Terminate IS a wire-level kill.
+  //
+  // Idle and terminal states don't render Terminate (no pending
+  // gate to terminate, or run is already over). Post-exec's
+  // submitting is theoretical — post-exec has no Edit path so
+  // never enters submitting today; guard still applies harmlessly.
+  const canTerminate =
+    !props.disabled &&
+    props.pendingReview !== null &&
+    (mode === "decision-required" || mode === "submitting");
+
+  // allowEdit: is the Edit button visible/usable?
+  //   Post-exec hides Edit (wedge prevention — humanVerifyGateStep
+  //   treats edit≡approve server-side; offering Edit would wedge the
+  //   submitting state forever since no fresh review.requested
+  //   follows a post-exec edit. DO NOT re-enable here without also
+  //   changing the server semantic. Polish item #11 queued.)
+  //   Exhausted also hides Edit because Block 1 already spent its
+  //   3-pass budget — a reviewer note would trip the refine budget
+  //   with the same upstream cause.
+  const allowEdit = mode === "decision-required" && !isPostExec && !isExhausted;
+
+  const trimmedLength = note.trim().length;
+  const canSubmitEdit =
+    allowEdit && canDecide && trimmedLength > 0 && trimmedLength <= REVIEW_EDIT_NOTES_MAX;
+
+  const handleApprove = () => {
+    if (!canDecide || !props.pendingReview || isExhausted) return;
+    props.onDecide("approve", { stepId: props.pendingReview.stepId });
+  };
+
+  const handleReject = () => {
+    if (!canDecide || !props.pendingReview) return;
+    props.onDecide("reject", { stepId: props.pendingReview.stepId });
+  };
+
+  const handleEdit = () => {
+    if (!canSubmitEdit || !props.pendingReview) return;
+    const trimmed = note.trim();
+    setSubmittedAtPlanId(currentPlanId);
+    props.onDecide("edit", {
+      notes: trimmed,
+      stepId: props.pendingReview.stepId,
+    });
+  };
+
+  // Week-2a gate-decision-model — Terminate two-step confirmation.
+  // First click arms (stores timestamp; armed-state useEffect above
+  // auto-resets after TERMINATE_CONFIRM_MS). Second click within
+  // the window commits by firing onDecide("terminate"). Asymmetric
+  // vs Approve/Reject/Edit (which commit on single click) because
+  // terminate is a destructive-action-style wire-level kill —
+  // deliberation discipline matches the Cmd+Enter safety posture.
+  const handleTerminate = () => {
+    if (!canTerminate || !props.pendingReview) return;
+    if (terminateArmedAt === null) {
+      setTerminateArmedAt(Date.now());
+      return;
+    }
+    setTerminateArmedAt(null);
+    props.onDecide("terminate", { stepId: props.pendingReview.stepId });
+  };
+
+  // 7b.iii.b-pre-exec-edit-ui — local-only escape hatch.
+  // Resets UI state to default; does NOT cancel the server-side
+  // Block 1 refine (it can't be interrupted mid-flight in this
+  // release). Intended for two cases:
+  //   (a) reviewer regret after Submit;
+  //   (b) pathological wedge where the fresh review.requested never
+  //       arrives (Block 1 bug, network loss, etc.).
+  // When the fresh review.requested DOES arrive later, it flips the
+  // planId-delta effect above and the bar renders in
+  // decision-required mode. Any approve/reject clicked on the stale
+  // bar between Cancel-refine and the fresh request arriving lands
+  // in the bus's stale-discard path (commit-1 semantics) and is
+  // logged but not acted on — reviewer must re-click once the fresh
+  // request appears.
+  const handleCancelRefine = () => {
+    setSubmittedAtPlanId(null);
+    setNote("");
+  };
+
+  // Cmd/Ctrl+Enter handler (Artifact 5 — ≤10 LoC, verbatim from proposal).
+  // C1: `.trim().length > 0` — whitespace-only is empty.
+  // C2: strict silent no-op — no toast, no shake; macOS/Windows textareas
+  //     native-no-op on Cmd/Ctrl+Enter so the browser eats it cleanly.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === "Enter";
+    if (!isCmdEnter) return;
+    if (note.trim().length === 0) return;
+    if (!canDecide || !allowEdit) return;
+    e.preventDefault();
+    handleEdit();
+  };
+
+  // Placeholder per state/sub-state (Artifact 4 — 5 final strings).
+  const placeholder = (() => {
+    if (mode === "terminal") return "Run complete";
+    if (mode === "submitting") return "";
+    if (mode === "decision-required" && isPostExec) {
+      return "Add a note (optional), then click Approve / Reject";
+    }
+    if (mode === "decision-required") {
+      return "Add a note for Edit, or click Approve / Reject";
+    }
+    return "Note will attach to your next decision";
+  })();
+
+  // Status line copy — replaces today's ReviewPanel h3+p blocks with a
+  // single paragraph above the textarea. Copy is preserved in intent
+  // from each ReviewPanel variant (exhausted / post-exec / submitting /
+  // default pre-exec / terminal).
+  const statusLine = (() => {
+    if (mode === "submitting") {
+      return "Re-planning… Block 1 is re-running with your note as a prior observation.";
+    }
+    if (mode === "terminal") {
+      return `${describeDecision(props.frames)} — no further action needed.`;
+    }
+    if (mode === "decision-required") {
+      if (isExhausted) {
+        const passes = blockResult?.passes ?? 0;
+        return `⚠ Block 1 exhausted — ${passes} pass${
+          passes === 1 ? "" : "es"
+        } failed. Reject to terminate; override-and-proceed is Week-2 polish.`;
+      }
+      if (isPostExec) {
+        return `Post-execution review. Reject triggers a backtrack through Block 1 (max ${MAX_BACKTRACKS_UI} retries per run).`;
+      }
+      const actionCount = props.pendingReview?.plan.actionCount ?? 0;
+      const destructive = props.pendingReview?.plan.destructive ?? false;
+      return `${actionCount} action${actionCount === 1 ? "" : "s"}${
+        destructive ? " · ⚠ destructive" : ""
+      }`;
+    }
+    return null;
+  })();
+
+  const exhaustedReasons =
+    isExhausted && Array.isArray(blockResult?.allReasons)
       ? blockResult!.allReasons!
       : [];
-    return (
-      <div className="review-panel exhausted" data-testid="review-panel-exhausted">
-        <div className="review-info">
-          <h3>⚠ Block 1 exhausted — {passes} pass{passes === 1 ? "" : "es"} failed</h3>
-          <p>
-            The planning agent could not produce a viable plan within its iteration
-            budget. Reject this run to terminate; override-and-proceed is deferred
-            to Week-2 polish.
-          </p>
-          {reasons.length > 0 && (
-            <p className="review-exhausted-reasons">
-              Reasons: {reasons.map((r, i) => (
-                <span key={i} className="review-exhausted-reason-chip">
-                  {r.replace(/_/g, " ")}
-                </span>
-              ))}
-            </p>
-          )}
+
+  const className = [
+    "chat-bar",
+    mode,
+    isPostExec ? "post-exec" : "",
+    isExhausted ? "exhausted" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const textareaDisabled = mode === "submitting" || mode === "terminal";
+
+  return (
+    <div className={className} data-testid="chat-bar">
+      {statusLine && <p className="chat-bar-status">{statusLine}</p>}
+      {isExhausted && exhaustedReasons.length > 0 && (
+        <div className="chat-bar-exhausted-reasons">
+          <span>Reasons:</span>
+          {exhaustedReasons.map((r, i) => (
+            <span key={i} className="chat-bar-exhausted-reason-chip">
+              {r.replace(/_/g, " ")}
+            </span>
+          ))}
         </div>
-        <div className="review-actions">
-          <button className="btn reject" onClick={props.onReject} disabled={props.disabled}>
+      )}
+      <textarea
+        className="chat-bar-textarea"
+        placeholder={placeholder}
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={onKeyDown}
+        maxLength={REVIEW_EDIT_NOTES_MAX}
+        rows={3}
+        disabled={textareaDisabled}
+        data-testid="chat-bar-textarea"
+      />
+      <div className="chat-bar-meta">
+        <span className="chat-bar-counter" aria-live="polite">
+          {trimmedLength} / {REVIEW_EDIT_NOTES_MAX}
+        </span>
+        <div className="chat-bar-actions">
+          {mode === "submitting" && (
+            <button
+              type="button"
+              className="chat-bar-cancel-refine"
+              onClick={handleCancelRefine}
+              data-testid="chat-bar-cancel-refine"
+              title="Unlock the panel without cancelling the agent's refine work"
+            >
+              Cancel refine (unlock panel)
+            </button>
+          )}
+          {allowEdit && (
+            <button
+              type="button"
+              className="btn edit"
+              onClick={handleEdit}
+              disabled={!canSubmitEdit}
+              data-testid="chat-bar-edit"
+              title="Send the agent additional context and re-plan (Cmd/Ctrl+Enter)"
+            >
+              Edit
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn reject"
+            onClick={handleReject}
+            disabled={!canDecide}
+            data-testid="chat-bar-reject"
+          >
             Reject
           </button>
           <button
+            type="button"
             className="btn approve"
-            disabled
-            title="Approve disabled on exhausted runs — reject to terminate. Override-and-proceed is Week-2 polish."
+            onClick={handleApprove}
+            disabled={!canDecide || isExhausted}
+            data-testid="chat-bar-approve"
+            title={
+              isExhausted
+                ? "Approve disabled on exhausted runs — reject to terminate. Override-and-proceed is Week-2 polish."
+                : undefined
+            }
           >
             Approve
           </button>
         </div>
       </div>
-    );
-  }
-
-  // 7b.iii.b commit 4 — post-exec review variant. Triggered when the
-  // incoming review.requested carries reviewHint="post_exec" (emitted
-  // by humanVerifyGateStep). Different question than pre-exec:
-  //   - Pre-exec: "does this plan look right?" (approve / edit / reject)
-  //   - Post-exec: "did execution achieve the goal?" (approve / reject only)
-  //
-  // Edit is DELIBERATELY HIDDEN on this path. Rationale:
-  //   The server-side humanVerifyGateStep treats decision="edit" as
-  //   equivalent to "approve" (both take the happy path, ending the
-  //   run). Showing an Edit button that means the same thing as
-  //   Approve is confusing UX. Worse, the ReviewPanel's submitting-mode
-  //   state machine (planId-delta auto-exit via `submittedAtPlanId`)
-  //   assumes an Edit triggers a fresh review.requested. Post-exec
-  //   edit wouldn't produce one — the gate returns happy-path to
-  //   logAndNotifyStep — so the UI would wedge forever in submitting
-  //   mode with only the Cancel-refine escape hatch. Hiding Edit
-  //   prevents this wedge. If post-exec "approve with audit note" is
-  //   wanted later, either (a) change the server semantic to have
-  //   edit not terminate, or (b) use a separate text field on approve.
-  //   DO NOT re-enable Edit here without also changing the server.
-  //
-  // Branches BEFORE submitting-mode check because post-exec has no
-  // Edit path to put it into submitting — this block is terminal for
-  // the post-exec panel.
-  const isPostExec = props.request.reviewHint === "post_exec";
-
-  if (isPostExec) {
-    return (
-      <div className="review-panel post-exec" data-testid="review-panel-post-exec">
-        <div className="review-info">
-          <h3>Post-execution review</h3>
-          <p>
-            Did the agent achieve the ticket&apos;s goal? Evidence is in the
-            behavior feed above — check the <code>execute:*</code> screenshots
-            and the verify output. Reject triggers a backtrack through Block 1
-            (max {MAX_BACKTRACKS_UI} retries per run).
-          </p>
-        </div>
-        <div className="review-actions">
-          <button
-            className="btn reject"
-            onClick={props.onReject}
-            disabled={props.disabled}
-            data-testid="review-post-exec-reject"
-          >
-            Reject (backtrack)
-          </button>
-          <button
-            className="btn approve"
-            onClick={props.onApprove}
-            disabled={props.disabled}
-            data-testid="review-post-exec-approve"
-          >
-            Approve (complete)
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // Submitting mode — Block 1 is re-running with the reviewer's note.
-  // All primary controls disabled; waiting for the fresh
-  // review.requested to arrive (detected via the planId-delta effect
-  // above). A local escape hatch is always available (see comment
-  // on the Cancel-refine button).
-  if (mode === "submitting") {
-    return (
-      <div className="review-panel submitting" data-testid="review-panel-submitting">
-        <div className="review-info">
-          <h3>Re-planning…</h3>
-          <p>
-            Block 1 is re-running with your note as a prior observation.
-            The refined plan will appear here in a few seconds.
-          </p>
-        </div>
-        <div className="review-actions">
-          <button className="btn btn-ghost" disabled aria-busy="true">
-            Waiting for refined plan…
-          </button>
-          {/*
-            7b.iii.b-pre-exec-edit-ui — local-only escape hatch.
-            Resets UI state to default mode; does NOT cancel the
-            server-side Block 1 refine (it can't be interrupted
-            mid-flight in this release). Intended for two cases:
-              (a) reviewer regret after Submit;
-              (b) pathological wedge where the fresh review.requested
-                  never arrives (Block 1 bug, network loss, etc.).
-            When the fresh review.requested DOES arrive later, it
-            replaces `pendingReview` via the memo and the panel
-            renders it in default mode. Any approve/reject clicked
-            on the stale panel between Cancel-refine and the fresh
-            request arriving lands in the bus's stale-discard path
-            (commit-1 semantics) and is logged but not acted on —
-            reviewer must re-click once the fresh request appears.
-          */}
+      {/*
+        Week-2a gate-decision-model — Terminate affordance.
+        Secondary-row danger link (NOT a button in the action group)
+        so the visual hierarchy keeps Approve/Edit/Reject as primary
+        and Terminate as escape-hatch. Two-step confirmation (arm
+        via first click, commit via second click within
+        TERMINATE_CONFIRM_MS) is the destructive-action discipline:
+        Terminate is a wire-level kill that can't be undone once
+        committed. Renders in BOTH decision-required AND submitting
+        states so a wedged refine can still be killed (reviewer
+        can't rescue a hung run via Cancel-refine alone — that's
+        UI-only).
+      */}
+      {canTerminate && (
+        <div className="chat-bar-terminate-row">
           <button
             type="button"
-            className="btn btn-ghost"
-            onClick={() => {
-              setMode("default");
-              setSubmittedAtPlanId(null);
-              setNotes("");
-            }}
-            data-testid="review-refine-cancel"
-            title="Unlock the panel without cancelling the agent's refine work"
+            className={
+              terminateArmedAt !== null
+                ? "chat-bar-terminate-link armed"
+                : "chat-bar-terminate-link"
+            }
+            onClick={handleTerminate}
+            data-testid="chat-bar-terminate"
+            title={
+              terminateArmedAt !== null
+                ? "Click again to confirm — ends the run immediately"
+                : "End this run entirely (requires confirmation click)"
+            }
           >
-            Cancel refine (unlock panel)
+            {terminateArmedAt !== null
+              ? "─ Really terminate? (click again within 3s to confirm) ─"
+              : "─ Terminate run (end ticket) ─"}
           </button>
         </div>
-      </div>
-    );
-  }
-
-  // Edit mode — textarea + submit/cancel. Submit transitions the
-  // panel into submitting mode and fires props.onEdit(trimmed) which
-  // sends WS review.decide(edit, {notes}). The server emits a fresh
-  // review.requested after Block 1 re-runs; the planId-delta effect
-  // above flips us back to default mode when that arrives.
-  if (mode === "edit") {
-    const trimmed = notes.trim();
-    const canSubmit =
-      trimmed.length > 0 &&
-      trimmed.length <= REVIEW_EDIT_NOTES_MAX &&
-      !props.disabled;
-    return (
-      <div className="review-panel edit-mode" data-testid="review-panel-edit">
-        <div className="review-info">
-          <h3>Guide the agent · re-plan</h3>
-          <p>
-            Tell the planning agent what additional context or constraint to
-            apply, then submit to re-run Block 1. Your note is threaded into
-            the next planning pass as a prior observation. Up to 2 refines
-            per run.
-          </p>
-        </div>
-        <form
-          className="review-edit-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!canSubmit) return;
-            setSubmittedAtPlanId(currentPlanId);
-            setMode("submitting");
-            props.onEdit(trimmed);
-          }}
-        >
-          <textarea
-            className="review-edit-notes"
-            placeholder="e.g., the target user is jane@example.com; use the Unlock Account runbook, not Password Reset"
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            maxLength={REVIEW_EDIT_NOTES_MAX}
-            rows={4}
-            autoFocus
-            data-testid="review-edit-notes"
-          />
-          <div className="review-edit-meta">
-            <span className="review-edit-counter" aria-live="polite">
-              {trimmed.length} / {REVIEW_EDIT_NOTES_MAX}
-            </span>
-            <div className="review-edit-actions">
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={() => {
-                  setMode("default");
-                  setNotes("");
-                }}
-                data-testid="review-edit-cancel"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="btn btn-primary"
-                disabled={!canSubmit}
-                data-testid="review-edit-submit"
-              >
-                Submit &amp; re-plan
-              </button>
-            </div>
-          </div>
-        </form>
-      </div>
-    );
-  }
-
-  // Default mode — three buttons (Edit | Reject | Approve).
-  return (
-    <div className="review-panel">
-      <div className="review-info">
-        <h3>Review requested</h3>
-        <p>
-          {actionCount} action{actionCount === 1 ? "" : "s"}
-          {destructive ? " · ⚠ destructive" : ""}
-        </p>
-      </div>
-      <div className="review-actions">
-        <button
-          className="btn edit"
-          onClick={() => setMode("edit")}
-          disabled={props.disabled}
-          data-testid="review-edit-btn"
-          title="Send the agent additional context and re-plan"
-        >
-          Edit
-        </button>
-        <button className="btn reject" onClick={props.onReject} disabled={props.disabled}>
-          Reject
-        </button>
-        <button className="btn approve" onClick={props.onApprove} disabled={props.disabled}>
-          Approve
-        </button>
-      </div>
+      )}
     </div>
   );
 }
@@ -1863,17 +2046,35 @@ function bucketByStep(frames: Frame[]): Map<StepId, StepBucket> {
 
 function deriveStepStatus(frames: Frame[]): StepStatus {
   if (frames.length === 0) return "pending";
-  const hasStarted = frames.some((f) => f.type === "step.started");
-  const hasCompleted = frames.some((f) => f.type === "step.completed");
-  const hasFailed = frames.some((f) => f.type === "step.failed");
-  const hasReviewRequested = frames.some((f) => f.type === "review.requested");
-  const hasReviewDecided = frames.some((f) => f.type === "review.decided");
+  // Week-2a ux-polish — use the LATEST lifecycle frame, not any-ever
+  // aggregation. On refine / backtrack runs the same stepId emits
+  // {started, completed, started, completed, ...} across passes; the
+  // pre-polish any-ever logic stuck on "completed" after pass 1 and
+  // never surfaced subsequent "running" transitions. `findLast`
+  // captures whichever lifecycle edge was most recent, so pass-2
+  // step.started correctly flips the LEFT-column status back to
+  // running (and the Week-2a shimmer selector activates).
+  //
+  // The review-gate awaiting branch is preserved via `hasPendingReview`
+  // — a gate that emitted review.requested without a matching
+  // review.decided is "awaiting" regardless of its step.* lifecycle
+  // state. review.decided flips back to running until the terminal
+  // step.completed emits.
+  const latestLifecycle = frames.findLast(
+    (f) =>
+      f.type === "step.started" ||
+      f.type === "step.completed" ||
+      f.type === "step.failed",
+  );
+  const hasPendingReview =
+    frames.some((f) => f.type === "review.requested") &&
+    !frames.some((f) => f.type === "review.decided");
 
-  if (hasFailed) return "failed";
-  if (hasCompleted) return "completed";
-  if (hasReviewRequested && !hasReviewDecided) return "awaiting";
-  if (hasStarted) return "running";
-  return "pending";
+  if (hasPendingReview) return "awaiting";
+  if (!latestLifecycle) return "pending";
+  if (latestLifecycle.type === "step.failed") return "failed";
+  if (latestLifecycle.type === "step.started") return "running";
+  return "completed";
 }
 
 function deriveRunStatus(frames: Frame[]): StepStatus | "ok" | "rejected" {

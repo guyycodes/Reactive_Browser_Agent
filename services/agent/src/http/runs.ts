@@ -23,7 +23,10 @@ const reviewBodySchema = z.object({
    *  for back-compat; defaults to "review_gate" server-side so
    *  pre-7b.iii.b curl scripts keep working unchanged. */
   stepId: GateStepIdSchema.optional(),
-  decision: z.enum(["approve", "reject", "edit"]),
+  // Week-2a gate-decision-model — mirrors clientFrameSchema in
+  // envelope.ts. Both HTTP POST /runs/:id/review and the WS
+  // `review.decide` client frame accept the same 4-value enum.
+  decision: z.enum(["approve", "reject", "edit", "terminate"]),
   by: z.string().min(1),
   idempotencyKey: z.string().uuid().optional(),
   patch: z.record(z.unknown()).optional(),

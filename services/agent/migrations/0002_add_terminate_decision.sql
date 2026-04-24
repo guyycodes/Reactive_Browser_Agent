@@ -1,0 +1,41 @@
+-- 0002_add_terminate_decision.sql — Week-2a 4-decision HIL model.
+--
+-- Extends reviews.decision CHECK constraint to include 'terminate'
+-- alongside the pre-existing 'approve','reject','edit'. New decision
+-- semantics:
+--
+--   approve   — "proceed with this plan" (existing)
+--   reject    — "this plan is wrong, try again (no specific guidance)"
+--               Pre-exec: refine loop w/ auto-generated seed observation.
+--               Post-exec: backtrack loop (existing behavior).
+--   edit      — "this plan is wrong, here's HOW" (existing; pre-exec only)
+--   terminate — NEW. "stop this run entirely, don't replan."
+--               Pre-exec: skip cascade → logAndNotifyStep status=rejected
+--                         (this is the mechanism pre-week2a "reject" used;
+--                          repurposed under the clearer name).
+--               Post-exec: return {success: false, skipped: true} →
+--                          symmetric with budget-exhaust's Finding 2 fix
+--                          in week2a-gate-exhaust-status.
+--
+-- See services/agent/src/mastra/workflows/triage.ts runReviewGateStep
+-- / humanVerifyGateStep for the runtime dispatch; see
+-- services/agent/src/events/envelope.ts ReviewDecidedFrame.decision for
+-- the wire-contract enum.
+--
+-- Idempotent: DROP CONSTRAINT IF EXISTS guards replay (same mechanism
+-- as 0001_init.sql's CREATE TABLE IF NOT EXISTS). Constraint name
+-- 'reviews_decision_check' matches Postgres's auto-naming convention
+-- for inline column-level CHECKs (<table>_<column>_check). If a prior
+-- schema edit produced a different name, DROP IF EXISTS short-circuits
+-- safely and this ADD CONSTRAINT lays down the canonical named form
+-- going forward.
+--
+-- Transactional: the migration runner in src/db/migrate.ts:49-57 wraps
+-- this file in a single transaction, so an ADD CONSTRAINT failure
+-- (e.g., pre-existing row with value outside the new enum — impossible
+-- today since the prior enum is a subset) rolls back the DROP and
+-- retries on next run.
+
+ALTER TABLE reviews DROP CONSTRAINT IF EXISTS reviews_decision_check;
+ALTER TABLE reviews ADD CONSTRAINT reviews_decision_check
+  CHECK (decision IN ('approve', 'reject', 'edit', 'terminate'));

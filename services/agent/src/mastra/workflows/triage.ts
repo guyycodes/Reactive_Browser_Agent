@@ -210,7 +210,14 @@ const DryRunSchema = z.object({
 });
 
 const ReviewSchema = z.object({
-  decision: z.enum(["approve", "reject", "edit"]),
+  // Week-2a gate-decision-model — 4-value enum matches envelope.ts
+  // ReviewDecidedFrame.decision. runReviewGateStep's return value
+  // in practice only produces "approve" (happy path) or "terminate"
+  // (skip-cascade trigger) — "reject" and "edit" exit via the refine
+  // loop which either converges to approve or exhausts to terminate.
+  // Kept at 4 values for wire-contract consistency; narrowing to
+  // z.enum(["approve", "terminate"]) is a Week-2 polish queue item.
+  decision: z.enum(["approve", "reject", "edit", "terminate"]),
   approved: z.boolean(),
   dryRun: DryRunSchema,
 });
@@ -1281,21 +1288,48 @@ export async function runReviewGateStep(
     if (decision.decision === "approve") {
       return { decision: "approve", approved: true, dryRun: currentDryRun };
     }
-    if (decision.decision === "reject") {
-      return { decision: "reject", approved: false, dryRun: currentDryRun };
+
+    // Week-2a gate-decision-model — terminate short-circuits to the
+    // skip cascade (executeStep.skipped → verifyStep.skipped →
+    // logAndNotifyStep status=rejected). This is the mechanism
+    // pre-week2a "reject" used verbatim; repurposed under the
+    // clearer name. Browser cleanup via http/triage.ts:213-219
+    // finally block fires on any return path so no special teardown
+    // needed here.
+    if (decision.decision === "terminate") {
+      return {
+        decision: "terminate",
+        approved: false,
+        dryRun: currentDryRun,
+      };
     }
 
-    // decision.decision === "edit" — refine path.
+    // decision.decision === "edit" OR decision.decision === "reject"
+    //   — both route into the refine loop. The difference is the
+    //   seed observation that goes into Block 1's priorObservations:
+    //     edit   → reviewer's patch.notes (if present) or
+    //              edit-without-notes fallback copy.
+    //     reject → reject-without-notes directive copy (more
+    //              prescriptive: "take a different approach").
+    //   Both share the MAX_PRE_GATE_REFINES budget — a mix of edits
+    //   and rejects counts against the same cap (3 total refine
+    //   cycles per run).
     if (refineCount >= MAX_PRE_GATE_REFINES) {
-      // Budget trip. Terminate as reject — flows through the
-      // existing executeStep.skipped → verifyStep.skipped →
-      // logAndNotifyStep status=rejected path. No distinct UI
-      // signal in commit 2; that's commit 3 scope.
+      // Week-2a gate-decision-model — cap trip terminates cleanly
+      // via the new terminate mechanism (same skip-cascade as an
+      // explicit reviewer Terminate click). Pre-week2a returned
+      // decision="reject" which used the same mechanism but
+      // conflated reviewer-initiated full-stop with "reject =
+      // replan." The new model separates them.
       logger.warn(
         { runId, refineCount, max: MAX_PRE_GATE_REFINES },
-        "[review_gate] pre-exec refine budget exhausted; terminating as reject",
+        "[review_gate] pre-exec refine budget exhausted; terminating",
       );
-      return { decision: "reject", approved: false, dryRun: currentDryRun };
+      return {
+        decision: "terminate",
+        approved: false,
+        dryRun: currentDryRun,
+      };
     }
 
     if (!ticket) {
@@ -1304,15 +1338,20 @@ export async function runReviewGateStep(
       // Block 1; terminate cleanly rather than crash.
       logger.error(
         { runId },
-        "[review_gate] RunContext.ticket undefined; cannot refine. Terminating as reject.",
+        "[review_gate] RunContext.ticket undefined; cannot refine. Terminating.",
       );
-      return { decision: "reject", approved: false, dryRun: currentDryRun };
+      return {
+        decision: "terminate",
+        approved: false,
+        dryRun: currentDryRun,
+      };
     }
 
     refineCount++;
     const carriedContext = buildPreGateRefineContext(
       decision.patch?.notes,
       refineCount,
+      decision.decision === "reject" ? "reject" : "edit",
     );
 
     bus.publish({
@@ -1759,12 +1798,31 @@ function block1ResultToDryRun(
 function buildPreGateRefineContext(
   notes: unknown,
   refineCount: number,
+  // Week-2a gate-decision-model — distinguishes "reject=replan-no-notes"
+  // from "edit=replan-with-notes" for prompt-engineering purposes.
+  // The seed observation text differs so Sonnet doesn't produce the
+  // same plan on reject. Default "edit" preserves back-compat for any
+  // call sites that don't pass the arg (there's one: triage.ts ~1330
+  // at the refine-loop entry; it always passes the arg explicitly).
+  decisionKind: "edit" | "reject" = "edit",
 ): string[] {
   const note = typeof notes === "string" ? notes.trim() : "";
-  const raw =
-    note.length > 0
-      ? `Pre-exec refine ${refineCount}: reviewer note: ${note}`
-      : `Pre-exec refine ${refineCount}: reviewer requested retry without specific notes; re-attempt with current context.`;
+  let raw: string;
+  if (note.length > 0) {
+    raw = `Pre-exec refine ${refineCount}: reviewer note: ${note}`;
+  } else if (decisionKind === "reject") {
+    // Week-2a gate-decision-model — reject-no-notes seed. Directive
+    // (not merely descriptive) so Sonnet doesn't produce an identical
+    // plan on the next pass. Trimmed to ~180 chars per reviewer-LLM
+    // RFC audit (half the tokens of the original 330-char draft;
+    // same directive intent).
+    raw = `Pre-exec refine ${refineCount}: reviewer rejected the prior plan without notes. Try a fundamentally different approach — different skill card, different action sequence, or different assumption about the ticket's goal.`;
+  } else {
+    // edit-without-notes back-compat (PlanPatchSchema.notes is
+    // optional; a client that sends decision=edit with no patch
+    // still lands in this branch).
+    raw = `Pre-exec refine ${refineCount}: reviewer requested retry without specific notes; re-attempt with current context.`;
+  }
   return [raw.slice(0, 400)];
 }
 
@@ -1896,6 +1954,29 @@ const humanVerifyGateStep = createStep({
     const ctx = getRunContext();
     const { runId, bus, ticket } = ctx;
 
+    // Week-2a gate-decision-model-hotfix-1 — upstream skipped=true
+    // pass-through. When pre-exec Terminate cascades through
+    // executeStep.skipped → verifyStep.skipped, the VerifySchema
+    // that arrives here carries skipped=true and there is no
+    // destructive action to review. Pre-hotfix: the gate opened
+    // anyway and awaited a decision, causing the post-exec
+    // review.requested{post_exec} to publish on runs the reviewer
+    // had just terminated — a confusing UX (P4 smoke observed: a
+    // second terminate at post-exec was required to close the
+    // run). Post-hotfix: pass through to logAndNotifyStep verbatim
+    // so status=rejected derives from the existing skipped=true
+    // mapping at line 1638-1642, same mechanism Finding 2's
+    // budget-exhaust fix uses.
+    //
+    // Placement is BEFORE backtrackCount init + while loop — the
+    // guard fires before any bus work, any decision await, any
+    // local state. Symmetric with executeStep's skip-guard at the
+    // top of runExecuteStep (line 1421-1430) and verifyStep's
+    // analogous check.
+    if (inputData.skipped) {
+      return inputData;
+    }
+
     let currentVerify = inputData;
     let backtrackCount = 0;
 
@@ -1942,18 +2023,59 @@ const humanVerifyGateStep = createStep({
       if (decision.decision === "approve" || decision.decision === "edit") {
         // Happy path — return the current verify output. Mastra's
         // workflow engine proceeds to logAndNotifyStep with status=ok.
+        // Edit is treated as approve here per the wedge-prevention
+        // docblock at the top of this step's Commit 4 implementation
+        // (humanVerifyGateStep treats edit≡approve server-side; UI
+        // hides Edit on post-exec to prevent the wedge).
         return currentVerify;
+      }
+
+      // Week-2a gate-decision-model — terminate short-circuits to
+      // logAndNotifyStep with status=rejected. Symmetric with the
+      // budget-exhaust return shape (Finding 2 fix, landed in
+      // week2a-gate-exhaust-status): skipped=true surfaces
+      // reviewer-initiated rejection via the derivation at line
+      // 1638-1642. Does NOT enter the backtrack loop — the reviewer
+      // explicitly wants to stop, not iterate.
+      if (decision.decision === "terminate") {
+        return {
+          ...currentVerify,
+          success: false,
+          skipped: true,
+          evidence: [
+            ...currentVerify.evidence,
+            `Post-exec review terminated by reviewer after backtrack ${backtrackCount}.`,
+          ],
+        };
       }
 
       // Reject. Check backtrack budget.
       if (backtrackCount >= MAX_BACKTRACKS) {
         logger.warn(
           { runId, backtrackCount, max: MAX_BACKTRACKS },
-          "[human_verify_gate] backtrack budget exhausted; returning failed verify",
+          "[human_verify_gate] backtrack budget exhausted; returning rejected verify",
         );
+        // Week-2a gate-exhaust-status (Finding 2) — set skipped=true
+        // so logAndNotifyStep's derivation at line 1638-1642 emits
+        // status=rejected, not status=failed.
+        //
+        // Semantic rationale: skipped=true ≡ reviewer-initiated
+        // rejection (the cascade path today's pre-exec reject /
+        // terminate uses). Budget exhaust means the reviewer
+        // refused the work MAX_BACKTRACKS+1 times — that's an
+        // aggregated reviewer rejection, not a workflow execution
+        // error. Pre-fix: the return omitted skipped, which fell
+        // through to status=failed in logAndNotifyStep (pollutes
+        // the rejected-vs-failed forensic semantics and implied
+        // workflow-layer fault when there was none).
+        //
+        // Symmetric with: runReviewGateStep's reject/cap-trip paths
+        // (line 1285-1310) which return approved=false → executeStep
+        // skipped → verifyStep skipped → logAndNotifyStep rejected.
         return {
           ...currentVerify,
           success: false,
+          skipped: true,
           evidence: [
             ...currentVerify.evidence,
             `Backtrack budget exhausted after ${backtrackCount} iteration${backtrackCount === 1 ? "" : "s"}; final human-verify decision: reject.`,
@@ -2067,18 +2189,22 @@ const humanVerifyGateStep = createStep({
               },
             };
 
-      // Re-enter review_gate. Pre-exec reject during a backtrack
-      // terminates the run (matches the split documented in the
-      // workflow top comment — pre-exec reject is "this plan is
-      // wrong", no further retry).
+      // Re-enter review_gate. Pre-exec terminate (or the internal
+      // refine-budget cap trip which now returns decision="terminate"
+      // too per the week2a gate-decision-model) short-circuits the
+      // backtrack chain. Pre-exec "reject" under the new model routes
+      // through the refine loop inside runReviewGateStep and never
+      // exits with decision="reject" directly — so `gate1Out.decision`
+      // here is always "approve" (continue) or "terminate" (short-
+      // circuit).
       const gate1Out = await runReviewGateStep(gate1InputDry);
       let nextVerify: z.infer<typeof VerifySchema>;
-      if (gate1Out.decision === "reject") {
+      if (gate1Out.decision === "terminate") {
         nextVerify = {
           success: false,
           skipped: true,
           evidence: [
-            `Pre-exec review rejected during backtrack ${backtrackCount}.`,
+            `Pre-exec review terminated during backtrack ${backtrackCount}.`,
           ],
           execute: {
             stepsRun: 0,

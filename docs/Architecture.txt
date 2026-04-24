@@ -515,12 +515,26 @@ surfaces — the product's pitch lives here.
                            │
                            ├─▶ emit fresh review.requested
                            │
-                           └─▶ await next decision
-                                 ├─ approve → proceed to executeStep
-                                 ├─ reject  → terminate run
-                                 └─ edit    → refine again
-                                              (cap MAX_PRE_GATE_REFINES=2;
-                                               3rd edit terminates as reject)
+                           └─▶ await next decision (4-decision model — Week-2a):
+                                 ├─ approve   → proceed to executeStep
+                                 ├─ edit      → refine loop with reviewer's
+                                 │              patch.notes threaded as seed
+                                 │              observations
+                                 ├─ reject    → refine loop with auto-generated
+                                 │              directive seed ("take a
+                                 │              different approach")
+                                 │              NOTE: reject was pre-week2a
+                                 │              a terminate; week2a widened
+                                 │              the enum so reject now means
+                                 │              "replan without notes" and
+                                 │              terminate is the explicit
+                                 │              full-stop below
+                                 ├─ terminate → skip cascade to
+                                 │              logAndNotifyStep
+                                 │              (status=rejected)
+                                 └─ cap trip  → returns decision=terminate
+                                              (MAX_PRE_GATE_REFINES=2 shared
+                                               budget across edit+reject)
 
 
 6.2  POST-EXEC BACKTRACK (triggered by reviewer REJECTING at human_verify_gate)
@@ -561,13 +575,33 @@ surfaces — the product's pitch lives here.
                            │
                            ├─▶ NEW post-exec review.requested lands
                            │
-                           └─▶ await next decision
-                                 ├─ approve → run.completed (status=ok)
-                                 ├─ reject  → backtrack again
-                                 │             (cap MAX_BACKTRACKS=2)
-                                 └─ (edit treated as approve — Edit is
-                                    hidden in the UI on post-exec to
-                                    prevent a wedge state)
+                           └─▶ await next decision (4-decision model — Week-2a):
+                                 ├─ approve   → run.completed (status=ok)
+                                 ├─ edit      → treated as approve (UI hides
+                                 │              Edit on post-exec to prevent
+                                 │              a wedge; server semantic is
+                                 │              edit ≡ approve on this gate)
+                                 ├─ reject    → backtrack loop (re-run
+                                 │              block1 → reviewGate →
+                                 │              execute → verify with
+                                 │              carried observations)
+                                 │              (cap MAX_BACKTRACKS=2)
+                                 ├─ terminate → return {success: false,
+                                 │              skipped: true}; logAndNotify
+                                 │              emits status=rejected via
+                                 │              the skipped-derivation path
+                                 └─ cap trip  → {success: false,
+                                              skipped: true} — same
+                                              skipped-derivation path as
+                                              terminate (Finding 2 fix
+                                              from Commit A)
+
+         Pre-exec Terminate skip-guard (Week-2a gate-decision-model-hotfix-1):
+           humanVerifyGateStep entry checks `if (inputData.skipped) return
+           inputData;` before any bus work. When pre-exec Terminate cascades
+           through executeStep.skipped → verifyStep.skipped, the post-exec
+           gate does NOT open — skipped VerifySchema flows through verbatim
+           and logAndNotify's skipped-derivation emits status=rejected.
 
 
 Both loops are structurally symmetric. They use the SAME envelope variant
@@ -751,15 +785,49 @@ PRIMITIVES LAYER
   1. Envelope: add your new stepId to `GateStepIdSchema` (the narrow
      enum used by `clientFrameSchema.review.decide.stepId`).
   2. Envelope: add the corresponding stepId to `StepIdSchema` too.
-  3. In `triage.ts`, implement the step body:
+  3. Decide 4-decision dispatch semantics for your gate. The Week-2a
+     gate-decision-model gives you four client-side inputs; you MUST
+     map each to a workflow action:
+         approve   — typically "proceed to next step in the chain"
+         reject    — typically "replan without reviewer notes" (refine
+                     with an auto-generated directive observation); on
+                     post-exec-style gates this is the backtrack entry
+                     point
+         edit      — typically "replan with reviewer's patch.notes"
+                     (refine with notes as seed observations); HIDE on
+                     gates where edit ≡ approve to prevent wedge states
+                     (see humanVerifyGateStep for the pattern)
+         terminate — ALWAYS a skip-cascade to logAndNotify with
+                     status=rejected; never loops, never replans
+  4. In `triage.ts`, implement the step body. Example pattern matches
+     runReviewGateStep / humanVerifyGateStep:
          bus.publish({ runId, stepId, payload:
            { type: "review.requested", plan, screenshots, viewerUrl,
              requiresApproval: true, reviewHint: "my_phase" } });
          const decision = await bus.awaitDecisionForStep(runId, "<stepId>");
-         // branch on decision.decision
-  4. Register the new stepId in the workflow chain via `.then(myGate)`.
-  5. In the reviewer UI, add a branch to `<ReviewPanel>` keyed on
-     `pendingReview.reviewHint === "my_phase"`.
+         if (decision.decision === "approve") { /* proceed */ }
+         if (decision.decision === "terminate") { /* skip-cascade */ }
+         if (decision.decision === "reject")   { /* replan w/o notes */ }
+         if (decision.decision === "edit")     { /* replan w/ notes */ }
+     IMPORTANT: if your gate's implementation path cascades skipped=true
+     upstream (like pre-exec Terminate does through executeStep /
+     verifyStep), place a skip-guard at the gate's entry:
+         if (inputData.skipped) return inputData;
+     BEFORE any bus.publish, decision await, or local state init. See
+     humanVerifyGateStep's Week-2a hotfix-1 guard at triage.ts:1976-1978
+     for the canonical shape.
+  5. Register the new stepId in the workflow chain via `.then(myGate)`.
+  6. In the reviewer UI (services/test-webapp), extend the ChatBar
+     state machine if your gate has distinct copy. The ChatBar reads
+     `pendingReview.reviewHint` to branch Submit-button labels and
+     body copy; add a new reviewHint enum value if your gate is
+     semantically distinct from pre_exec / post_exec (envelope.ts
+     ReviewRequestedFrame.reviewHint).
+     - If edit ≡ approve on your gate: hide the Edit button via
+       `isPostExec` or equivalent guard (copy the pattern from
+       humanVerifyGateStep's wedge-prevention docblock).
+     - Terminate link is always available via `canTerminate` and
+       needs no per-gate wiring — the two-step confirm UI is generic.
 
 
 9.5  APPLY REACT TO AN EXISTING STEP

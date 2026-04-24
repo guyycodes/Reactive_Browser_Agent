@@ -239,18 +239,24 @@ Seeded users to play with (every `email@example.com` works; any non-empty passwo
 
 ## 1.6 End-to-end `/triage` with real RAG + real browser (Week 1B, post-7b.iii.b commit 4)
 
-As of 7b.iii.b commit 4, the workflow is a **9-step chain with TWO human gates**:
+As of Week-2a (gate-decision-model + hotfix-1), the workflow is a **9-step chain with TWO human gates, 4 decision inputs per gate**:
 
 ```
 block1Step (classify → retrieve → plan → dry_run, up to 3 passes)
-  → reviewGateStep (PRE-EXEC GATE: approve / reject / edit-refine)
+  → reviewGateStep (PRE-EXEC GATE: approve / reject-replan / edit-replan / terminate)
   → executeStep
   → verifyStep
-  → humanVerifyGateStep (POST-EXEC GATE: approve / reject-backtrack)
+  → humanVerifyGateStep (POST-EXEC GATE: approve / reject-backtrack / terminate)
   → logAndNotifyStep
 ```
 
-Every step is real (except `log_and_notify` which still emits a minimal synthetic span — Week 2 polish). The workflow now supports **human-guided meta-loops at both gates**: pre-exec Edit threads the reviewer's note into the next Block 1 pass (`MAX_PRE_GATE_REFINES = 2`); post-exec Reject triggers a full `block1 → reviewGate → execute → verify` backtrack with carried observations (`MAX_BACKTRACKS = 2`). Both loops thread context via `runBlock1(..., { seedObservations: ... })` — NO `withRunContext({ ...ctx, priorObservations }, fn)` spread around `runBlock1` (CTX SPREAD INVARIANT in `runContext.ts`).
+**4-decision semantics** (Week-2a gate-decision-model):
+- `approve` — proceed (unchanged).
+- `reject` — replan without reviewer's notes. Pre-exec: refine loop with auto-generated directive seed observation ("Try a fundamentally different approach…"). Post-exec: backtrack loop (unchanged).
+- `edit` — replan with reviewer's notes. Pre-exec only (post-exec treats edit ≡ approve; UI hides Edit).
+- `terminate` — full-stop. Skip-cascade to `logAndNotifyStep` with `status=rejected`. Pre-exec: `runReviewGateStep` short-circuits. Post-exec: `humanVerifyGateStep` sets `skipped: true`. Pre-exec terminate cascades correctly through the post-exec gate via the entry skip-guard at `triage.ts:1976-1978` (hotfix-1).
+
+Every step is real (except `log_and_notify` which still emits a minimal synthetic span — Week 2 polish). The workflow supports **human-guided meta-loops at both gates**: pre-exec Edit threads the reviewer's note into the next Block 1 pass (`MAX_PRE_GATE_REFINES = 2`, shared budget with Reject); post-exec Reject triggers a full `block1 → reviewGate → execute → verify` backtrack with carried observations (`MAX_BACKTRACKS = 2`). Both loops thread context via `runBlock1(..., { seedObservations: ... })` — NO `withRunContext({ ...ctx, priorObservations }, fn)` spread around `runBlock1` (CTX SPREAD INVARIANT in `runContext.ts`).
 
 Runs are session-isolated: each spawn gets its own `--user-data-dir`; `runDryRunStep` pre-closes `ctx.browser` before each `launchBrowser` so intra-Block-1 multi-pass retries and refine/backtrack re-invocations don't collide on Playwright MCP's per-run profile lock.
 
@@ -375,7 +381,7 @@ docker exec postgres psql -U agent -d agent -c \
 
 ### 1.6.5 Pre-exec Edit-refine path (7b.iii.b commit 4)
 
-The reviewer can guide the agent from the **pre-exec** review gate by clicking **Edit** (instead of Approve / Reject) and typing a note. The note threads into the next Block 1 pass as `priorObservations`; Block 1 re-runs classify/retrieve/plan/dry_run; a fresh `review.requested` appears; reviewer decides again. Cap: `MAX_PRE_GATE_REFINES = 2` (3 total review cycles; 3rd Edit terminates as reject).
+The reviewer can guide the agent from the **pre-exec** review gate by clicking **Edit** (instead of Approve / Reject / Terminate) and typing a note. Week-2a gate-decision-model: Edit threads reviewer's notes as seed observations; Reject threads an auto-generated directive seed observation ("take a different approach") into the SAME refine loop; Terminate skip-cascades to `status=rejected` (see §1.6.5.1 below). Edit and Reject share `MAX_PRE_GATE_REFINES = 2` budget (3 total review cycles across any mix of Edit/Reject; 3rd refine trip returns `decision: "terminate"` from the cap-trip path).
 
 **UI walkthrough:**
 
@@ -400,6 +406,41 @@ curl -sS -X POST "http://localhost:3001/runs/<runId>/review" \
   -H 'content-type: application/json' \
   -d '{"decision":"edit","by":"operator","patch":{"notes":"use the Unlock Account runbook"},"idempotencyKey":"'"$(uuidgen | tr A-Z a-z)"'"}'
 ```
+
+### 1.6.5.1 Pre-exec Terminate path (Week-2a gate-decision-model)
+
+The reviewer can full-stop the run at the pre-exec review gate by clicking the **Terminate** text-link beneath the three primary buttons. Distinct from Reject (which replans) — Terminate is the explicit kill. Two-step confirmation prevents accidental clicks.
+
+**UI walkthrough:**
+
+1. Kick a run (§1.6.2). Wait for the review gate.
+2. In the ChatBar, click the **Terminate** text-link. The link arms: label changes to `─ Really terminate? (click again within 3s to confirm) ─` and `.armed` className applies.
+3. Click **Terminate** again within 3 seconds. Panel transitions to `submitting`-then-`terminal` mode; all controls disable.
+4. Watch the RIGHT behavior feed:
+   - `review.decided { decision: "terminate" }` fires.
+   - Skip-cascade begins: `executeStep` returns `{ stepsRun: 0, skipped: true }`; `verifyStep` returns `{ success: false, skipped: true, evidence: [] }`; **`humanVerifyGateStep`'s entry skip-guard fires** — `inputData.skipped === true` → returns immediately without opening the post-exec gate. No `review.requested{post_exec}` emits.
+   - `logAndNotifyStep` runs; `run.completed { status: "rejected" }` fires.
+5. Verify DB cross-check: Jane's row is NOT mutated — `status` remains whatever it was pre-run; `last_password_reset_at` is NOT updated.
+
+**Expected run latency post-terminate: ~2 seconds** (skip-cascade has no LLM calls, no Playwright work — just state threading through the remaining steps).
+
+**Curl equivalent:**
+
+```bash
+curl -sS -X POST "http://localhost:3001/runs/<runId>/review" \
+  -H 'content-type: application/json' \
+  -d '{"decision":"terminate","by":"operator","idempotencyKey":"'"$(uuidgen | tr A-Z a-z)"'"}'
+```
+
+Post-exec Terminate is symmetric — same curl with `"stepId":"human_verify_gate"` and same skip-cascade-to-rejected outcome.
+
+**Smoke acceptance (P4 path):**
+
+- `run.completed.status === 'rejected'`
+- ZERO `review.requested` frames where `payload.reviewHint === 'post_exec'`
+- `reviews.decision === 'terminate'` in Postgres
+- 4 forensic fingerprints all 0 (§1.6.7 SQL queries unchanged)
+- Jane unchanged (pre-run state preserved)
 
 ### 1.6.6 Post-exec gate path + backtrack (7b.iii.b commit 4)
 
@@ -501,6 +542,38 @@ ORDER BY seq;
 ```
 
 See `docs/MASTER_PLAN.md` for the full forensic fingerprint table + causal narrative ("Bug A hid Bug B hid Bug 4; Bug 3A orthogonal").
+
+### 1.6.7.1 Budget-exhaust + Terminate clarification (post-Commit-A / Commit-B)
+
+Budget exhaust and explicit Terminate both map to `run.completed.status === 'rejected'` via the skipped-derivation path at `triage.ts:1638-1642`. Pre-week2a, post-exec budget exhaust produced `status: 'failed'` — that was wrong (workflow-layer fault, not reviewer-initiated rejection). Commit A (Finding 2) fixed the exhaust path to set `skipped: true`; Commit B added Terminate which uses the same mechanism. Sanity check on any terminated-or-exhausted run:
+
+```bash
+docker compose exec -T postgres psql -U agent -d agent -c "
+SELECT id, status
+FROM runs
+WHERE id = '<run-id>';
+"
+# Expect: status='rejected' for terminate / exhaust paths.
+# status='failed' should ONLY appear on runs where a step body threw an
+# unhandled exception (genuine workflow faults) — NOT on budget exhaust
+# or explicit terminate decisions.
+```
+
+The 4 forensic SQL fingerprints from §1.6.7 remain unchanged by Week-2a — no new failure modes introduced. Run them on every new `run_id` as before.
+
+### 1.6.8 ChatBar testids (Week-2a reviewer UI reference)
+
+Data-testids live on every interactive ChatBar control so Playwright and browser-MCP drivers can automate the reviewer surface. Stable across all four ChatBar modes (`idle` / `decision-required` / `submitting` / `terminal`).
+
+| Element | Testid | Notes |
+|---|---|---|
+| ChatBar textarea | `chat-bar-textarea` | Enabled in `idle` + `decision-required` modes; becomes `patch.notes` payload on Edit submit |
+| Approve button | `chat-bar-approve` | Disabled on exhausted blocks (`blockResult.passedLast === false`) |
+| Reject button | `chat-bar-reject` | Always enabled in `decision-required` mode; routes to refine loop (pre-exec) or backtrack (post-exec) |
+| Edit button | `chat-bar-edit` | Enabled only when textarea has non-empty trimmed content (`canSubmitEdit`). HIDDEN in `idle` AND on post-exec (`reviewHint === "post_exec"`). Cmd+Enter keyboard shortcut also fires Edit. |
+| Terminate link | `chat-bar-terminate` | Always available when `canTerminate === true`. Two-step confirm: first click arms (`.armed` className), second click within `TERMINATE_CONFIRM_MS = 3000` commits `decision: "terminate"`. |
+| Exhausted banner | `chat-bar-exhausted-banner` | Rendered when `blockResult.passedLast === false` |
+| Decision-mode pulse | `.chat-bar.decision-required` | CSS `animation: toolPulse 1.8s ease-out infinite` — verify visually (respects `prefers-reduced-motion`) |
 
 ---
 

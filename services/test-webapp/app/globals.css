@@ -314,27 +314,6 @@ code, pre { font-family: var(--mono); }
   50% { opacity: 0; }
 }
 
-.review-panel {
-  position: sticky;
-  bottom: 0;
-  margin: 20px 0 0;
-  padding: 16px 20px;
-  background: var(--surface);
-  border: 1px solid var(--warn);
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  box-shadow: 0 10px 40px rgba(0,0,0,0.45);
-}
-
-.review-panel.decided { border-color: var(--ok); }
-
-.review-info h3 { margin: 0 0 4px; font-size: 14px; }
-.review-info p { margin: 0; color: var(--text-dim); font-size: 12px; }
-.review-actions { display: flex; gap: 10px; }
-
 .conn-strip {
   display: flex;
   align-items: center;
@@ -405,15 +384,6 @@ code, pre { font-family: var(--mono); }
   overflow: hidden;
 }
 
-/* Kill the sticky-bottom behavior inherited from the base .review-panel
- * rule. The shell is viewport-bounded now so natural flex-flow at the
- * bottom of the column is correct; sticky would add no value and could
- * cause a 1px-offset stacking artifact over the feed column's scrollbar. */
-.review-page > .review-panel {
-  position: static;
-  bottom: auto;
-}
-
 .review-layout {
   flex: 1 1 0;
   min-height: 0;
@@ -424,12 +394,24 @@ code, pre { font-family: var(--mono); }
 }
 
 .review-outcomes-col {
+  /* Week-2a — ChatBar UX refactor. Column becomes a flex-column with a
+   * scrollable inner `.review-outcomes-scroll` child and a bottom-pinned
+   * `.chat-bar` sibling. The scroll / gap / padding-right properties
+   * move to the inner wrapper; the aside itself only provides the
+   * flex layout and min-height:0 for the grid track. */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.review-outcomes-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-width: 0;
-  min-height: 0;
-  overflow-y: auto;
   padding-right: 4px;   /* avoid scrollbar overlapping the column's right edge */
 }
 
@@ -498,6 +480,11 @@ code, pre { font-family: var(--mono); }
  * fills downward from a stable anchor line. */
 .behavior-feed > * {
   scroll-margin-top: 33vh;
+  /* Week-2a ux-polish — breathing room when a streaming bubble anchors
+   * with {block: "end"} (see BehaviorFeed effect in page.tsx). No
+   * effect on the 7a.v top-anchor path — scrollIntoView block:"start"
+   * reads scroll-margin-top only. */
+  scroll-margin-bottom: 12vh;
 }
 
 /* Commit 7b.ii — feed-item wrapper + ReAct nesting visual.
@@ -550,27 +537,146 @@ code, pre { font-family: var(--mono); }
 .feed-block-divider.exhausted::before,
 .feed-block-divider.exhausted::after { background: rgba(255, 107, 107, 0.4); }
 
-/* 7b.iii.a — exhausted-passes review panel. Distinct red treatment
- * + the reason chips summarize per-pass failure reasons. Approve
- * button is disabled via the `disabled` attribute on the button
- * itself; CSS just provides the visual weight. */
-.review-panel.exhausted {
-  border-color: rgba(255, 107, 107, 0.5);
-  background: linear-gradient(
-      180deg,
-      rgba(255, 107, 107, 0.06),
-      transparent 60%
-    ),
-    var(--surface);
+/* ======================================================================
+ * Week-2a — ChatBar UX refactor (replaces the legacy .review-panel*).
+ *
+ * Jakob's-Law persistent input surface pinned to the bottom of the LEFT
+ * column. Width inherits from the column (which is grid-bound to
+ * --left-pct via .review-layout). Four modes driven by `className` composition:
+ *   .chat-bar.idle                  — no pending gate; textarea enabled,
+ *                                     buttons disabled; muted border
+ *   .chat-bar.decision-required     — gate pending; accent border + pulse
+ *     &.exhausted                   — err-tint border overrides accent;
+ *                                     Approve disabled via DOM attr
+ *     &.post-exec                   — warm (--warn) border; Edit hidden
+ *                                     in TSX via allowEdit guard
+ *   .chat-bar.submitting            — accent border + opacity dim; textarea
+ *                                     disabled; Cancel-refine link visible
+ *   .chat-bar.terminal              — muted border; all controls disabled
+ *
+ * Animation reuse: .chat-bar.decision-required reuses @keyframes toolPulse
+ * from 7a.v — NO new keyframes. Stops automatically on mode flip because
+ * the selector no longer matches (class composition changes).
+ * ====================================================================== */
+
+.chat-bar {
+  flex: 0 0 auto;
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color 120ms ease, opacity 120ms ease;
 }
-.review-exhausted-reasons {
-  margin-top: 4px;
+
+.chat-bar.decision-required {
+  border-color: var(--warn);
+  animation: toolPulse 1.8s ease-out infinite;
+}
+
+.chat-bar.decision-required.exhausted {
+  border-color: rgba(255, 107, 107, 0.5);
+  animation: none;
+  background: linear-gradient(180deg, rgba(255, 107, 107, 0.06), transparent 60%), var(--surface);
+}
+
+.chat-bar.decision-required.post-exec {
+  border-color: var(--warn);
+}
+
+.chat-bar.submitting {
+  border-color: var(--accent);
+  opacity: 0.85;
+}
+
+.chat-bar.terminal {
+  border-color: var(--border);
+  opacity: 0.75;
+}
+
+.chat-bar-status {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chat-bar-textarea {
+  width: 100%;
+  min-height: 64px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.chat-bar-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.18);
+}
+
+.chat-bar-textarea::placeholder {
+  color: var(--text-dim);
+}
+
+.chat-bar-textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.chat-bar-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.chat-bar-counter {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-bar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.chat-bar-cancel-refine {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+  padding: 4px 8px;
+  text-decoration: underline dotted rgba(255, 255, 255, 0.15);
+  text-underline-offset: 3px;
+}
+
+.chat-bar-cancel-refine:hover { color: var(--text); }
+
+.chat-bar-exhausted-reasons {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
-  font-size: 11px !important;
+  font-size: 11px;
+  color: var(--text-dim);
 }
-.review-exhausted-reason-chip {
+
+.chat-bar-exhausted-reason-chip {
   display: inline-block;
   padding: 2px 8px;
   background: rgba(255, 107, 107, 0.1);
@@ -583,89 +689,52 @@ code, pre { font-family: var(--mono); }
   text-transform: uppercase;
 }
 
-/* ======================================================================
- * Commit 7b.iii.b-pre-exec-edit-ui — pre-exec Edit path UI.
+/* ---- Week-2a gate-decision-model — Terminate affordance ---- *
  *
- * Edit-mode: the sticky review panel swaps from flex-row (Approve /
- * Reject buttons) to flex-column (info block + textarea form). Layout
- * is additive — default mode keeps the existing row unchanged.
+ * Secondary-row danger link below the primary Approve/Edit/Reject
+ * action group. Two-step confirm: default state = muted-err color,
+ * armed state = accent-err color with subtle pulse glow. Matches
+ * the toolPulse reuse discipline (no new keyframes) — armed-state
+ * glow is a static box-shadow rather than an animation since the
+ * 3-second arm window is too short to make a pulse read as "live"
+ * vs "about to commit."
  *
- * Submitting-mode: intermediate state between Submit and the fresh
- * review.requested arrival. Visually the panel stays accent-bordered
- * (matches edit-mode) and dims slightly via opacity; primary action
- * button is disabled, a ghost-styled local Cancel refine escape
- * hatch is always available so the reviewer can never get wedged.
- *
- * Color accent: --accent (blue) signals "human-guided refine in
- * progress" distinct from the default-mode warn-border and the
- * exhausted-mode err-border. Reuses --accent-rgb token from 7a.iii.
- * ====================================================================== */
-
-.review-panel.edit-mode {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 12px;
-  border-color: var(--accent);
-}
-
-.review-panel.submitting {
-  border-color: var(--accent);
-  opacity: 0.85;
-}
-
-.review-edit-form {
+ * No hover animation (transform: translateY) — matches the .btn
+ * group's deliberate-click discipline; a "jumpy" hover would
+ * undermine the destructive-action seriousness. */
+.chat-bar-terminate-row {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  justify-content: center;
+  padding-top: 4px;
 }
 
-.review-edit-notes {
-  width: 100%;
-  min-height: 88px;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font: inherit;
-  font-size: 13px;
-  line-height: 1.45;
-  resize: vertical;
-}
-
-.review-edit-notes:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.18);
-}
-
-.review-edit-notes::placeholder {
-  color: var(--text-dim);
-}
-
-.review-edit-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.review-edit-counter {
+.chat-bar-terminate-link {
+  background: transparent;
+  border: none;
+  color: rgba(255, 107, 107, 0.6);
   font-size: 11px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+  cursor: pointer;
+  padding: 4px 10px;
+  letter-spacing: 0.02em;
+  transition: color 120ms ease;
 }
 
-.review-edit-actions {
-  display: flex;
-  gap: 10px;
+.chat-bar-terminate-link:hover {
+  color: var(--err);
 }
 
-/* Edit button variant — accent-tinted to distinguish from the
- * destructive-action buttons (Reject / Approve) on either side.
- * Border uses the --accent-rgb token (consistent with --accent-rgb
- * usage in the tool-pulse animation from 7a.v). */
+.chat-bar-terminate-link.armed {
+  color: var(--err);
+  font-weight: 600;
+  background: rgba(255, 107, 107, 0.08);
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px rgba(255, 107, 107, 0.35);
+}
+
+/* Edit button variant (carried forward from the deleted ReviewPanel CSS —
+ * same accent-tint styling, same hover). Kept as .btn.edit so the shared
+ * button base class at .btn composes cleanly. */
 .btn.edit {
   border-color: rgba(var(--accent-rgb), 0.4);
   color: var(--accent);
@@ -673,36 +742,6 @@ code, pre { font-family: var(--mono); }
 
 .btn.edit:hover {
   background: rgba(var(--accent-rgb), 0.1);
-}
-
-/* ======================================================================
- * Commit 7b.iii.b commit 4 — post-exec review variant.
- *
- * Warm-accent border (--warn) distinguishes the post-exec "did it
- * work?" question from the pre-exec "does this plan look right?"
- * question. Matches the default pre-exec panel's warn-border — the
- * shared warm color cues "human decision pending" regardless of
- * gate phase, while the subtle info-copy differences signal the
- * semantic shift.
- *
- * Note on --warn rgba: globals.css has no --warn-rgb token (only
- * --warn: #f2b641). Existing rgba call sites (e.g., .badge.warn at
- * line 95) hardcode rgba(242,182,65,...). Keeping the hardcoded
- * pattern here for consistency; Week-2 CSS cleanup item: add
- * --warn-rgb token + normalize all call sites.
- * ====================================================================== */
-
-.review-panel.post-exec {
-  border-color: var(--warn);
-}
-
-.review-panel.post-exec .review-info p code {
-  font-family: var(--mono);
-  font-size: 12px;
-  padding: 1px 6px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 4px;
 }
 
 /* ======================================================================
@@ -992,6 +1031,34 @@ code, pre { font-family: var(--mono); }
 .step-outcome.completed { border-left-color: var(--ok); }
 .step-outcome.failed    { border-left-color: var(--err); }
 .step-outcome.awaiting  { border-left-color: var(--warn); }
+
+/* Week-2a ux-polish — active-step shimmer on LEFT-column outcome rows.
+ *
+ * Reuses @keyframes toolPulse from 7a.v (same --accent-rgb breathing
+ * box-shadow) so the currently-running step reads as "in-flight,
+ * stand by" — essential during refine / backtrack cycles where a
+ * step re-enters `running` after prior completion (unblocked by the
+ * deriveStepStatus fix in the same commit). Selector auto-stops when
+ * status flips to completed/failed/awaiting/pending.
+ *
+ * No new keyframes. No new tokens. Matches ChatBar's
+ * .chat-bar.decision-required pulse and the 7a.v .feed-tool.pending
+ * .marker pattern. */
+.step-outcome.running {
+  animation: toolPulse 1.8s ease-out infinite;
+}
+
+/* Respect user's motion preference. Scoped to all three toolPulse
+ * consumers (this row + ChatBar's decision-required + the 7a.v
+ * pending tool marker) so decorative motion is consistently
+ * disabled. Status + border-color changes remain visible. */
+@media (prefers-reduced-motion: reduce) {
+  .step-outcome.running,
+  .chat-bar.decision-required,
+  .feed-tool.pending .marker {
+    animation: none;
+  }
+}
 
 .step-outcome-head {
   display: flex;

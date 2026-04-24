@@ -54,7 +54,15 @@ export const reviews = pgTable(
       .primaryKey()
       .references(() => runs.id, { onDelete: "cascade" }),
     idempotencyKey: uuid("idempotency_key"),
-    decision: text("decision", { enum: ["approve", "reject", "edit"] }).notNull(),
+    // Week-2a gate-decision-model — 4-value decision enum. App-layer
+    // validation via Drizzle's `enum` constraint; Postgres-layer
+    // validation via the CHECK constraint at
+    // `migrations/0002_add_terminate_decision.sql`. Both must be
+    // kept in lockstep with envelope.ts ReviewDecidedFrame.decision
+    // and clientFrameSchema.review.decide.decision.
+    decision: text("decision", {
+      enum: ["approve", "reject", "edit", "terminate"],
+    }).notNull(),
     by: text("by").notNull(),
     decidedAt: timestamp("decided_at", { withTimezone: true }).notNull(),
     patch: jsonb("patch"),
