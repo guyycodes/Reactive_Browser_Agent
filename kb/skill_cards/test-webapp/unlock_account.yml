@@ -1,0 +1,66 @@
+# Skill card: unlock_account (test-webapp, Week-2b foundation)
+#
+# Unlocks a locked user without resetting their password. Currently
+# aspirational — the test-webapp UI's unlock affordance is the reset flow
+# (which both unlocks AND rotates the password). A distinct non-password
+# unlock path will be added to test-webapp in Week-2b-runtime if this skill
+# ships to a smoke; otherwise it stays as a declarative reference card.
+schemaVersion: "1"
+app: test-webapp
+base_url: http://test-webapp:3000
+auth:
+  strategy: cookie_session
+
+skills:
+  - name: unlock_account
+    description: >-
+      Unlock a user whose status is 'locked' without rotating their password.
+      Used when the reviewer knows the user was locked by brute-force
+      attempt counter and the existing password should be preserved.
+    destructive: true
+    inputs:
+      email:
+        type: email
+        required: true
+        description: The target user's email address to unlock.
+      operator_email:
+        type: email
+        required: true
+    preconditions:
+      - The target user's status is 'locked'.
+      - The operator has valid credentials for the admin portal.
+    postconditions:
+      - The target user's status is 'active'.
+      - The target user's last_password_reset_at timestamp is UNCHANGED from pre-skill.
+    steps:
+      - tool: navigate
+        args:
+          url: "/login"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Email
+              value: "{{ inputs.operator_email }}"
+            - name: Password
+              value: demo
+      - tool: click
+        args:
+          element: "Sign in button"
+      - tool: navigate
+        args:
+          url: "/users"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Search
+              value: "{{ inputs.email }}"
+      - tool: click
+        args:
+          element: "View link on target user row"
+      - tool: click
+        args:
+          element: "Unlock account button"
+      - tool: takeScreenshot
+        args:
+          label: "after-unlock"
+    rollback: []

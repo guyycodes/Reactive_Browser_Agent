@@ -1,0 +1,60 @@
+# Skill card: lookup_user (test-webapp, Week-2b foundation)
+#
+# Non-destructive read-only skill — navigates to the user search, filters
+# by email, opens the detail view, and captures a screenshot. Safe to run
+# without reviewer approval per the destructive=false flag.
+schemaVersion: "1"
+app: test-webapp
+base_url: http://test-webapp:3000
+auth:
+  strategy: cookie_session
+
+skills:
+  - name: lookup_user
+    description: >-
+      Look up a user by email and capture their current status + last
+      password reset timestamp. Read-only; no state change.
+    destructive: false
+    inputs:
+      email:
+        type: email
+        required: true
+        description: The target user's email address to look up.
+      operator_email:
+        type: email
+        required: true
+    preconditions:
+      - The operator has valid credentials for the admin portal.
+    postconditions:
+      - A screenshot of the user detail page is captured.
+      - The user's status + last_password_reset_at are visible in the DOM.
+    steps:
+      - tool: navigate
+        args:
+          url: "/login"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Email
+              value: "{{ inputs.operator_email }}"
+            - name: Password
+              value: demo
+      - tool: click
+        args:
+          element: "Sign in button"
+      - tool: navigate
+        args:
+          url: "/users"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Search
+              value: "{{ inputs.email }}"
+      - tool: click
+        args:
+          element: "View link on target user row"
+      - tool: snapshot
+        args: {}
+      - tool: takeScreenshot
+        args:
+          label: "user-detail"

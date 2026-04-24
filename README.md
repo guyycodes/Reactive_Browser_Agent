@@ -82,6 +82,61 @@ A `services-healthcheck` aggregator gates on `qdrant + postgres + rag` so toolin
 
 ---
 
+### Pivot point tag
+The `PLATFORM_PIVOT_POINT` tag is a snapshot of the IT-helpdesk substrate baseline. It's the commit that contains the IT-tool tool-layer and chain-bodies populated as the canonical reference implementation.
+
+## env variables
+```bash
+# Local overrides — gitignored. Mirror `.env.example` structure; keep values real.
+
+# --- LLM provider (used by the agent service — Claude Haiku/Sonnet/Opus) ---
+ANTHROPIC_API_KEY='sk-ant-...'
+
+# Pinned model identifiers.
+ANTHROPIC_MODEL_HAIKU=claude-haiku-4-5
+ANTHROPIC_MODEL_SONNET=claude-sonnet-4-5
+ANTHROPIC_MODEL_OPUS=claude-opus-4-5
+
+# Reserved for alternate providers; unused by the agent service today.
+OPENAI_API_KEY=
+
+# --- Postgres (matches docker-compose defaults; override if you change them) ---
+POSTGRES_USER=agent
+POSTGRES_PASSWORD=agent
+POSTGRES_DB=agent
+
+# --- Shared Qdrant collection UUIDs (per MASTER_PLAN §3) ---
+SHARED_RUNBOOKS_UUID=
+SHARED_SKILLS_UUID=
+SHARED_SELECTORS_UUID=
+
+# --- WebSocket origin allowlist for /stream/:runId ---
+ALLOWED_WS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:6080,http://127.0.0.1:6080,http://localhost:3001,http://127.0.0.1:3001
+
+# --- Target-app credentials (Week 1B — read by Playwright only, never surfaced to the LLM) ---
+TARGET_APP_USER=
+TARGET_APP_PASSWORD=
+
+# --- Hugging Face (used by services/rag for model downloads) ---
+HF_TOKEN=
+```
+
+## Clone the repo
+```bash
+# Fork first (via GitHub UI), then clone their fork
+git clone git@github.com:<their-username>/Reactive_Browser_Agent.git their-pivot
+cd their-pivot
+
+# Check out the pivot point tag (detached HEAD)
+git checkout PLATFORM_PIVOT_POINT
+
+# Create a new branch from this point for their pivot work
+git checkout -b vibe-coding-pivot   # or llm-training-pivot, generic-editor-pivot, etc.
+
+# Develop freely, push when ready
+git push origin vibe-coding-pivot
+```
+
 ## Bring it up
 
 ```bash

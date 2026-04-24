@@ -1,0 +1,32 @@
+# Skill card: check_system_status (test-webapp, Week-2b foundation)
+#
+# Non-destructive read-only skill — navigates to the /status widget page
+# and captures a screenshot. No auth required (status page is public on
+# test-webapp's current config).
+schemaVersion: "1"
+app: test-webapp
+base_url: http://test-webapp:3000
+auth:
+  strategy: none
+
+skills:
+  - name: check_system_status
+    description: >-
+      Read test-webapp's /status page and capture a screenshot of the 8
+      system widgets (6 green, 1 amber, 1 red per seeded state). Used by
+      tickets like "is the billing system still down?"
+    destructive: false
+    preconditions:
+      - The test-webapp /status route is reachable.
+    postconditions:
+      - A screenshot of the status page is captured.
+      - Widget counts + colors are visible in the DOM snapshot.
+    steps:
+      - tool: navigate
+        args:
+          url: "/status"
+      - tool: snapshot
+        args: {}
+      - tool: takeScreenshot
+        args:
+          label: "status-page"

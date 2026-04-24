@@ -1,0 +1,66 @@
+# Skill card: update_ticket_note (test-webapp, Week-2b foundation)
+#
+# Aspirational — the test-webapp does not yet ship a ticket-note UI surface.
+# Declared here so the planner has a destructive=false option when the
+# incoming ticket asks to "add a note to ticket T-XXX" and RAG retrieval
+# wants to surface this skill card as a candidate. Week-3+ test-webapp
+# extension will add the matching /tickets/:id/notes UI path, at which
+# point this skill's steps become runnable.
+schemaVersion: "1"
+app: test-webapp
+base_url: http://test-webapp:3000
+auth:
+  strategy: cookie_session
+
+skills:
+  - name: update_ticket_note
+    description: >-
+      Append a note to an IT ticket. Non-destructive w.r.t. user state;
+      modifies only the ticket's audit log. Currently aspirational — awaits
+      test-webapp ticket-note UI surface (Week-3+).
+    destructive: false
+    inputs:
+      ticket_id:
+        type: string
+        required: true
+        description: Ticket identifier (e.g. T-1234).
+      note:
+        type: string
+        required: true
+        description: Free-text note to append to the ticket.
+      operator_email:
+        type: email
+        required: true
+    preconditions:
+      - The operator has valid credentials for the admin portal.
+      - The ticket_id exists in the ticket system.
+    postconditions:
+      - The ticket's audit log includes the appended note with operator identity.
+    steps:
+      - tool: navigate
+        args:
+          url: "/login"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Email
+              value: "{{ inputs.operator_email }}"
+            - name: Password
+              value: demo
+      - tool: click
+        args:
+          element: "Sign in button"
+      - tool: navigate
+        args:
+          url: "/tickets/{{ inputs.ticket_id }}"
+      - tool: fillForm
+        args:
+          fields:
+            - name: Note
+              value: "{{ inputs.note }}"
+      - tool: click
+        args:
+          element: "Add note button"
+      - tool: takeScreenshot
+        args:
+          label: "note-appended"

@@ -303,6 +303,47 @@ export async function retrieveSkills(
   return retrieveFromCollection(query, env.SHARED_SKILLS_UUID, opts);
 }
 
+/**
+ * Week-2b-foundation — targeted skill-card retrieval for ReAct classify/plan.
+ *
+ * Both entrypoints compose a category-hint / intent-hint prefix onto the
+ * caller's query before hitting the same `SHARED_SKILLS_UUID` collection
+ * `retrieveSkills` uses. The prefix biases Qdrant's similarity ranking
+ * toward skill-card prose matching the classifier's current category
+ * guess (or the planner's declared intent).
+ *
+ * These functions are NOT wired into any workflow step in foundation —
+ * they exist so `week2c-react-classify` and `week2c-react-plan` can
+ * register them as ReAct tools without further `rag.ts` edits. The 2c
+ * commits wrap these with `tool.started` / `rag.retrieved` /
+ * `tool.completed` frame emissions at the ReAct registration site (see
+ * `retrieveStep` in `triage.ts` for the pattern).
+ *
+ * Error taxonomy (`RagClientError` / `RagSchemaError`) + 404→empty-hits
+ * translation + circuit-breaker retry behavior carry through from
+ * `retrieveFromCollection` unchanged.
+ */
+
+/** ReAct-classify tool: retrieve skill-card hints biased toward a category. */
+export async function retrieveCategoryHints(
+  category: string,
+  query: string,
+  opts: RetrieveOptions = {},
+): Promise<QaResponse> {
+  const composedQuery = `Category: ${category}. ${query}`;
+  return retrieveFromCollection(composedQuery, env.SHARED_SKILLS_UUID, opts);
+}
+
+/** ReAct-plan tool: retrieve skill-cards matching a declared intent. */
+export async function retrieveSkillCardsByIntent(
+  intent: string,
+  query: string,
+  opts: RetrieveOptions = {},
+): Promise<QaResponse> {
+  const composedQuery = `Intent: ${intent}. ${query}`;
+  return retrieveFromCollection(composedQuery, env.SHARED_SKILLS_UUID, opts);
+}
+
 /** ---------- Helpers ---------- */
 
 async function safeReadText(resp: Response): Promise<string> {

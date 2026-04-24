@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 
 import {
   retrieveFromCollection,
+  retrieveCategoryHints,
+  retrieveSkillCardsByIntent,
   RagClientError,
   RagSchemaError,
   DEFAULT_RETRY_CONFIG,
@@ -238,5 +240,113 @@ describe("rag client — exported defaults", () => {
     expect(DEFAULT_RETRY_CONFIG.factor).toBe(2);
     expect(DEFAULT_RETRY_CONFIG.randomize).toBe(true);
     expect(DEFAULT_RETRY_CONFIG.deadlineMs).toBe(90_000);
+  });
+});
+
+/**
+ * Week-2b foundation — targeted skill-card retrieval tools.
+ *
+ * These two tools delegate to `retrieveFromCollection` with a composed
+ * query prefix ("Category: X. ..." / "Intent: X. ...") and the
+ * `env.SHARED_SKILLS_UUID` collection. Tests verify:
+ *   [N]   `retrieveCategoryHints` composes the Category prefix and
+ *         routes to SHARED_SKILLS_UUID.
+ *   [N+1] `retrieveSkillCardsByIntent` composes the Intent prefix and
+ *         routes to SHARED_SKILLS_UUID.
+ *   [N+2] Both translate 404 → empty-hits envelope (delegation check —
+ *         `retrieveFromCollection`'s existing [3] test already guards
+ *         the underlying mechanism; this test guards that the new
+ *         wrappers preserve it).
+ *
+ * Setup (`test/setup.ts`) seeds `SHARED_SKILLS_UUID` to a canonical
+ * UUID4 so `env.SHARED_SKILLS_UUID` resolves at rag.ts import time.
+ * The expected collection_name in the sent body matches that value.
+ */
+const EXPECTED_SKILLS_UUID = "08de373f-ca2d-4e49-8ca9-5ff799ae5d40";
+
+describe("rag client — targeted skill-card retrieval tools (Week-2b foundation)", () => {
+  it("[7] retrieveCategoryHints composes 'Category: X. Y' prefix and routes to SHARED_SKILLS_UUID", async () => {
+    const mock = makeMockFetch([() => jsonResponse(200, happyBody)]);
+
+    const result = await retrieveCategoryHints(
+      "account_access",
+      "locked user needs help",
+      {
+        fetchImpl: mock.fetch,
+        ragUrl: TEST_RAG_URL,
+        retryConfig: FAST_RETRY,
+      },
+    );
+
+    expect(mock.calls.length).toBe(1);
+    expect(mock.calls[0]?.url).toBe(`${TEST_RAG_URL}/docs/models/qa`);
+
+    const sentBody = JSON.parse(String(mock.calls[0]?.init?.body));
+    expect(sentBody).toEqual({
+      query: "Category: account_access. locked user needs help",
+      collection_name: EXPECTED_SKILLS_UUID,
+    });
+
+    expect(result.hits.length).toBe(1);
+    expect(result.hits[0]?.id).toBe("f61c3add-44da-453a-b5e3-96f8910598f3");
+  });
+
+  it("[8] retrieveSkillCardsByIntent composes 'Intent: X. Y' prefix and routes to SHARED_SKILLS_UUID", async () => {
+    const mock = makeMockFetch([() => jsonResponse(200, happyBody)]);
+
+    const result = await retrieveSkillCardsByIntent(
+      "reset_password",
+      "jane has forgotten her password",
+      {
+        fetchImpl: mock.fetch,
+        ragUrl: TEST_RAG_URL,
+        retryConfig: FAST_RETRY,
+      },
+    );
+
+    expect(mock.calls.length).toBe(1);
+    const sentBody = JSON.parse(String(mock.calls[0]?.init?.body));
+    expect(sentBody).toEqual({
+      query: "Intent: reset_password. jane has forgotten her password",
+      collection_name: EXPECTED_SKILLS_UUID,
+    });
+
+    expect(result.hits.length).toBe(1);
+  });
+
+  it("[9] both tools translate 404 → empty-hits envelope (delegation guard)", async () => {
+    // retrieveCategoryHints + 404
+    const mockA = makeMockFetch([
+      () =>
+        jsonResponse(404, {
+          detail: `Collection '${EXPECTED_SKILLS_UUID}' not found in Qdrant.`,
+        }),
+    ]);
+    const resultA = await retrieveCategoryHints("anything", "query", {
+      fetchImpl: mockA.fetch,
+      ragUrl: TEST_RAG_URL,
+      retryConfig: FAST_RETRY,
+    });
+    expect(mockA.calls.length).toBe(1);
+    expect(resultA.hits).toEqual([]);
+    expect(resultA.docs).toEqual([]);
+    expect(resultA.request_id).toBe("rag-missing-collection");
+
+    // retrieveSkillCardsByIntent + 404
+    const mockB = makeMockFetch([
+      () =>
+        jsonResponse(404, {
+          detail: `Collection '${EXPECTED_SKILLS_UUID}' not found in Qdrant.`,
+        }),
+    ]);
+    const resultB = await retrieveSkillCardsByIntent("anything", "query", {
+      fetchImpl: mockB.fetch,
+      ragUrl: TEST_RAG_URL,
+      retryConfig: FAST_RETRY,
+    });
+    expect(mockB.calls.length).toBe(1);
+    expect(resultB.hits).toEqual([]);
+    expect(resultB.docs).toEqual([]);
+    expect(resultB.request_id).toBe("rag-missing-collection");
   });
 });

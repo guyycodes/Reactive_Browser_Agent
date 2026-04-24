@@ -15,7 +15,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check": "npm run typecheck && npm run test"
+    "check": "npm run typecheck && npm run test",
+    "validate:skill-cards": "tsx scripts/validate-skill-cards.ts",
+    "embed:skill-cards": "tsx scripts/embed-skill-cards.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.90.0",
@@ -27,6 +29,7 @@
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.36.4",
     "hono": "^4.6.12",
+    "js-yaml": "^4.1.1",
     "p-retry": "^6.2.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
@@ -34,6 +37,7 @@
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.17.10",
     "@types/ws": "^8.5.13",
     "drizzle-kit": "^0.28.1",
