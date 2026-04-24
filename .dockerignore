@@ -1,0 +1,55 @@
+# What stays OUT of any whole-repo-scope Docker build context.
+#
+# Per-service Dockerfiles build from their own service directory
+# (e.g., services/agent/), so the per-service .dockerignore files
+# (services/agent/.dockerignore, services/rag/.dockerignore,
+# services/test-webapp/.dockerignore) are what actually apply during
+# those builds. This root file is the belt-and-suspenders layer for any
+# root-context build + any future docker bake that uses the repo root.
+
+# --- Git / CI / self-reference ------------------------------------------------
+.git/
+.gitignore
+.dockerignore
+.github/
+
+# --- Dependencies + build artifacts ------------------------------------------
+node_modules/
+**/node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+**/*.tsbuildinfo
+
+# --- Python caches ------------------------------------------------------------
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+services/rag/pipeline_311/
+
+# --- Secrets ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- OS / editor cruft --------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# --- Docs — not needed in images ---------------------------------------------
+docs/
+README.md
+LICENSE
+*.md
+
+# --- Runtime artifacts --------------------------------------------------------
+.playwright-videos/
+playwright-report/
+test-results/
+coverage/
+*.log
+*.pid
+tmp/

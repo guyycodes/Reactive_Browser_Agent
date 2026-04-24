@@ -1,0 +1,45 @@
+{
+  "name": "@browser-agent/agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tier-1 IT triage agent: Mastra + Playwright MCP + Hono HTTP/WS. Transport + persistence layer (Commit 1).",
+  "type": "module",
+  "engines": {
+    "node": ">=20.20 <25"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "migrate": "tsx src/db/migrate.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.90.0",
+    "@hono/node-server": "^1.13.7",
+    "@hono/node-ws": "^1.1.1",
+    "@mastra/core": "^1.26.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@playwright/mcp": "0.0.70",
+    "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.36.4",
+    "hono": "^4.6.12",
+    "p-retry": "^6.2.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "postgres": "^3.4.5",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/ws": "^8.5.13",
+    "drizzle-kit": "^0.28.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "ws": "^8.18.0"
+  }
+}

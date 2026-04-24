@@ -1,0 +1,867 @@
+================================================================================
+ BROWSER_AGENT — AGENT CODE ARCHITECTURE (visual, beginner-friendly)
+================================================================================
+
+  Scope of this document: services/agent/src/**.ts ONLY.
+  (The broader stack — compose topology, rag, qdrant, test-webapp — lives in
+   ARCHITECTURE.md at the repo root. This file is ONLY the agent's TypeScript.)
+
+  Audience: someone who has never built an agentic codebase before.
+  Goal: see the shape. Understand what the ReAct pattern is and where it
+  lives. Know which file to touch when you want to add a tool, a step, a
+  gate, or a new LLM call. Be able to look at any single file and understand
+  its role in the bigger picture.
+
+  Read top-down — each section builds on the one above it.
+
+================================================================================
+ 0. MENTAL MODEL (read this first if "agentic code" is new)
+================================================================================
+
+An AGENT is just a program that:
+  (1) takes a goal ("reset Jane's password");
+  (2) uses an LLM to reason about HOW to achieve the goal;
+  (3) calls TOOLS (RAG search, browser automation, etc.) to observe the
+      world and take actions;
+  (4) reports back to a human WHO decides whether to proceed.
+
+This particular agent adds TWO product constraints on top:
+  • Every run is AUDITABLE — every thought, tool call, and observation is
+    emitted as an event frame, streamed to a reviewer UI, AND persisted to
+    Postgres. Nothing is lost between runs.
+  • Every destructive action passes through a HUMAN GATE — a step that
+    blocks the workflow until a reviewer approves, rejects, or asks the
+    agent to re-plan. Two gates exist: pre-execution ("does this plan look
+    right?") and post-execution ("did it actually work?").
+
+                                  ┌─────────┐
+  Raw ticket "reset Jane's       │         │
+  password" ────── POST /triage ─▶│  Agent  │── WebSocket /stream/:id ──▶ UI
+                                  │         │     (envelope frames)
+  Human decision ───── POST    ──▶│         │── HTTP to RAG / LLM / Browser ─▶
+  /runs/:id/review                 └─────────┘
+
+This file explains what's INSIDE that box.
+
+
+================================================================================
+ 1. LAYER CAKE (the clean-architecture view)
+================================================================================
+
+Like any well-factored backend, the agent has a small number of horizontal
+layers. Each layer ONLY talks to the layer immediately below it. Same
+discipline as Widget-SaaS's "Components → Contexts → Hooks → Services →
+Models → Backend" — just renamed for the agent domain.
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  ENTRY LAYER                                                       │
+  │  "HTTP and WebSocket routing — the outside-world boundary"         │
+  │                                                                    │
+  │    src/index.ts                    — Hono server bootstrap         │
+  │    src/http/triage.ts              — POST /triage                  │
+  │    src/http/runs.ts                — GET /runs/:id,                │
+  │                                      POST /runs/:id/review         │
+  │    src/http/static.ts              — GET /static (screenshots)     │
+  │    src/http/health.ts              — GET /healthz                  │
+  │    src/events/stream.ts            — WS /stream/:runId handler     │
+  └────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  ORCHESTRATION LAYER                                               │
+  │  "The workflow engine — 'run these steps in this order'"           │
+  │                                                                    │
+  │    src/mastra/workflows/triage.ts  — the 9-step workflow           │
+  │                                      + all extracted step bodies   │
+  │    src/mastra/lib/blockController  — Block 1 retry controller      │
+  │                                      (classify→retrieve→plan→dry)  │
+  │    src/mastra/lib/reactRunner.ts   — ReAct runner primitive        │
+  │    src/mastra/stepEmitter.ts       — Mastra events →               │
+  │                                      envelope frames               │
+  │    src/mastra/runContext.ts        — ambient per-run ctx           │
+  │                                      (AsyncLocalStorage wrapper)   │
+  └────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  TOOL LAYER                                                        │
+  │  "Wrappers around external services — LLM / RAG / Browser"         │
+  │                                                                    │
+  │    src/llm/streamMapper.ts         — Anthropic SDK streaming       │
+  │                                      → envelope frames             │
+  │    src/mastra/tools/rag.ts         — RAG HTTP client               │
+  │                                      (retrieveRunbooks/Skills)     │
+  │    src/mastra/tools/playwrightMcp  — Playwright MCP stdio client   │
+  │                                      (launchBrowser)               │
+  └────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  PRIMITIVES LAYER                                                  │
+  │  "Reusable pieces of infrastructure that everything else uses"     │
+  │                                                                    │
+  │    src/events/envelope.ts          — Zod schema for every frame    │
+  │                                      type (30+ variants)           │
+  │    src/events/bus.ts               — EventBus (ring buffer +       │
+  │                                      per-stepId decision slots)    │
+  │    src/events/persist.ts           — Postgres append-only writer   │
+  │    src/lib/circuit.ts              — circuit breaker               │
+  │    src/db/{client,schema,migrate}  — drizzle ORM wiring            │
+  │    src/env.ts, src/logger.ts       — Zod-validated env + pino      │
+  └────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  EXTERNAL WORLD (NOT part of the agent service)                    │
+  │    Anthropic API   (LLM — classify/plan/verify/ReAct thoughts)     │
+  │    rag:3009        (FastAPI — document retrieval)                  │
+  │    postgres:5432   (events + reviews + runs)                       │
+  │    test-webapp     (Chromium target for Playwright MCP)            │
+  │    Reviewer UI     (Next.js separate service, WS client)           │
+  └────────────────────────────────────────────────────────────────────┘
+
+Rules of thumb for beginners:
+  • Never import "up the stack." A tool wrapper should not import from a
+    workflow. A primitive should not know about the workflow engine.
+  • Every cross-layer call emits ≥1 envelope frame so the UI can see it
+    happen. This is the "frames are the source of truth" invariant.
+  • Every layer has a Zod schema at its boundary so bad data fails loud
+    instead of silently.
+
+
+================================================================================
+ 2. CORE CONCEPTS (one paragraph each, for beginners)
+================================================================================
+
+2.1  WORKFLOW STEP
+    A named unit of work with typed input/output. The agent has 9 of them
+    (see §3). Each step is a function registered with Mastra via
+    `createStep({ id, inputSchema, outputSchema, execute })`. Each step
+    automatically emits `step.started` / `step.completed` / `step.failed`
+    frames. Output of step N becomes input of step N+1.
+
+2.2  ENVELOPE FRAME
+    A JSON object with a `type` discriminator (e.g. `llm.thinking.delta`,
+    `tool.completed`, `review.requested`) and a small set of header fields
+    (runId, seq, stepId, ts). Every interesting event inside the agent
+    becomes a frame. Frames are capped at 16 KiB, validated by Zod,
+    persisted to Postgres, and streamed to the UI via WebSocket. The full
+    list lives in `src/events/envelope.ts`.
+
+2.3  EVENTBUS
+    A per-run in-memory ring buffer that:
+      • assigns monotonic `seq` numbers so the UI never sees gaps;
+      • fans frames out to any subscribed WebSocket clients;
+      • brokers human review decisions from the UI back into the workflow
+        (gate suspend / resume via per-stepId decision slots).
+    Lives in `src/events/bus.ts`.
+
+2.4  RUNCONTEXT
+    Per-run ambient data (runId, bus, ticket, browser session, prior
+    observations) carried through `await` boundaries via Node's
+    AsyncLocalStorage. Think of it as "thread-local for async code." Any
+    step or tool wrapper can call `getRunContext()` and see the same
+    object. Lives in `src/mastra/runContext.ts`.
+
+    CTX SPREAD INVARIANT (critical — read the docblock in that file):
+    `withRunContext({ ...ctx, field: v }, fn)` creates a NEW object.
+    Mutations inside the spread are LOST when the scope unwinds. Only
+    certain fields are safe to spread around (the file enumerates them).
+    Violations caused 3 of the 4 bugs we hunted during the 7b.iii.b
+    series.
+
+2.5  REACT PATTERN (THE big idea)
+    "Reasoning + Acting." Instead of the LLM emitting an answer in one
+    shot, it runs a LOOP:
+        think → call a tool → observe the result → think again
+    ...until it has enough information to produce a final answer. One
+    reusable factory (`createReActStep` in `src/mastra/lib/reactRunner.ts`)
+    implements this loop. You apply it to a step by listing the tools
+    that step can use. See §5 for the visual.
+
+2.6  GATE (HUMAN SUSPENSION POINT)
+    A workflow step whose `execute` function calls
+    `bus.awaitDecisionForStep(runId, stepId)` — which blocks until a human
+    posts a decision via HTTP or WebSocket. Two gates exist: pre-exec
+    (`review_gate`) and post-exec (`human_verify_gate`). Gates are
+    where the product's "human-in-the-loop" guarantee lives. See §6 for
+    the two meta-loops that gates can trigger.
+
+2.7  CIRCUIT BREAKER
+    A named reliability wrapper around unreliable external calls (mainly
+    the Anthropic API). Three-state machine: closed (normal) → open
+    (failing, short-circuit to error) → half-open (probe). Automatic
+    exponential-backoff retry on transient 5xx. Lives in
+    `src/lib/circuit.ts`. Get one by name: `getCircuit("anthropic")`.
+
+2.8  META-LOOP
+    A loop at the WORKFLOW level (not the step level) that re-runs
+    multiple steps with a reviewer's feedback incorporated. Two exist:
+    pre-exec refine (reviewer clicks Edit with a note → re-run Block 1)
+    and post-exec backtrack (reviewer rejects post-exec verification →
+    re-run the full pre-notify chain). See §6.
+
+
+================================================================================
+ 3. THE 9-STEP WORKFLOW (the backbone)
+================================================================================
+
+This is the sequential chain of work the agent performs for every ticket.
+Each box = one step. Arrows show data flow (output of N becomes input of
+N+1). Humans interact at TWO places (the double-bordered gate boxes).
+
+                       POST /triage with raw ticket
+                                   │
+                                   ▼
+              ┌────────────────────────────────────┐
+              │ block1Step (composite — see §4)    │
+              │  ┌─────────┐  ┌──────────┐         │
+              │  │classify │─▶│ retrieve │─┐       │
+              │  └─────────┘  └──────────┘ │       │
+              │    (Haiku)     (ReAct +    │       │
+              │                 RAG)       ▼       │
+              │               ┌──────┐ ┌────────┐  │
+              │               │ plan │▶│dry_run │  │
+              │               └──────┘ └────────┘  │
+              │               (Sonnet   (Playwright│
+              │                + think)  read-only)│
+              │     Retry up to 3 passes on        │
+              │     plan.requiresContext=true or   │
+              │     dry_run.domMatches=false       │
+              └────────────────────────────────────┘
+                                   │
+                                   ▼
+              ╔════════════════════════════════════╗
+              ║ reviewGateStep (PRE-EXEC HUMAN)    ║  reviewHint: "pre_exec"
+              ║                                    ║
+              ║  approve → proceed                 ║
+              ║  reject  → terminate (status=rej.) ║
+              ║  edit    → REFINE LOOP (§6.1)      ║
+              ║            carry note to next      ║
+              ║            Block 1 pass            ║
+              ║            (cap = 2 refines)       ║
+              ╚════════════════════════════════════╝
+                                   │  (on approve)
+                                   ▼
+                      ┌────────────────────────┐
+                      │ executeStep            │
+                      │  (Playwright — drives  │
+                      │   the destructive      │
+                      │   browser flow)        │
+                      └────────────────────────┘
+                                   │
+                                   ▼
+                      ┌────────────────────────┐
+                      │ verifyStep             │
+                      │  (Sonnet — reads       │
+                      │   post-exec state,     │
+                      │   emits success bool)  │
+                      └────────────────────────┘
+                                   │
+                                   ▼
+              ╔════════════════════════════════════╗
+              ║ humanVerifyGateStep                ║  reviewHint: "post_exec"
+              ║  (POST-EXEC HUMAN)                 ║
+              ║                                    ║
+              ║  approve → run.completed status=ok ║
+              ║  reject  → BACKTRACK LOOP (§6.2)   ║
+              ║            re-run FULL pre-notify  ║
+              ║            chain with observations ║
+              ║            (cap = 2 backtracks)    ║
+              ╚════════════════════════════════════╝
+                                   │  (on approve OR exhausted budget)
+                                   ▼
+                      ┌────────────────────────┐
+                      │ logAndNotifyStep       │
+                      │  (final event log row  │
+                      │   + close the run)     │
+                      └────────────────────────┘
+                                   │
+                                   ▼
+                         run.completed frame
+                             (status: ok | rejected | failed)
+
+
+Where to find each step's code:
+  block1Step             → src/mastra/workflows/triage.ts  (wraps runBlock1)
+  classify/retrieve/plan/dry_run  → same file (bodies named `runXxxStep`;
+                            blockController invokes them directly)
+  reviewGateStep         → same file  (`runReviewGateStep` — also hosts the
+                            pre-exec refine loop)
+  executeStep            → same file  (`runExecuteStep`)
+  verifyStep             → same file  (`runVerifyStep`)
+  humanVerifyGateStep    → same file  (hosts the post-exec backtrack loop)
+  logAndNotifyStep       → same file
+
+
+================================================================================
+ 4. BLOCK 1 — THE COGNITIVE SUB-WORKFLOW
+================================================================================
+
+Block 1 is the first workflow step BUT it's actually a little iteration
+controller internally. It runs classify → retrieve → plan → dry_run up
+to 3 times, carrying observations forward if the first pass didn't
+produce a viable plan.
+
+Why: sometimes Sonnet says "I need more info" on its first planning pass.
+Instead of giving up, we let it see its own failure reason and try again
+with that context.
+
+Block 1 is NOT a Mastra sub-workflow — it's a plain-TypeScript orchestrator
+(`src/mastra/lib/blockController.ts`) that invokes the extracted step
+bodies directly. It emits its OWN step.started/completed frames under
+their original stepIds (classify, retrieve, etc.) so the reviewer UI
+sees each sub-step as usual.
+
+                     block1Step.execute
+                          │
+                          ▼
+                 runBlock1(input, deps, { seedObservations? })
+                          │
+                          │ for each pass 0..BLOCK1_MAX_PASSES-1:
+                          │
+                          ├─▶ emit block.iteration.started
+                          │
+                          │  ┌──────────────────────────────────────────┐
+                          │  │ withRunContext({ ...ctx,                 │
+                          │  │   priorObservations: [...observations]}) │
+                          │  │                                          │
+                          │  │   runClassifyStep   (Haiku)              │
+                          │  │      ↓                                   │
+                          │  │   runRetrieveStep   (ReAct, RAG)         │
+                          │  │      ↓                                   │
+                          │  │   runPlanStep       (Sonnet + thinking)  │
+                          │  └──────────────────────────────────────────┘
+                          │    ↑ cognitive spread — safe because these
+                          │      three only READ from ctx
+                          │
+                          │  Exit check:
+                          │    plan.requiresContext?  → record "plan_requires_context"
+                          │    plan.actions==[]?      → record "plan_empty_actions"
+                          │    else run dry_run:
+                          │         ↓
+                          │    runDryRunStep    (Playwright, OUTER ctx scope)
+                          │                      ↑
+                          │                      │
+                          │                      └── DO NOT spread here — dry_run
+                          │                          MUTATES ctx.browser. See
+                          │                          CTX SPREAD INVARIANT in
+                          │                          runContext.ts.
+                          │
+                          │    dry_run.domMatches?  →  exit_signal_ok (break loop)
+                          │    else                →  record "dry_run_mismatch"
+                          │
+                          ├─▶ emit block.iteration.completed (with reason)
+                          │
+                          └─▶ next pass, with accumulated observations
+                              prepended to the next pass's prompts
+
+        On exhaust (3 passes, no exit): return Block1Result with
+        `passedLast: false` + `allReasons: [...]`. DryRunSchema.blockResult
+        is set; reviewer UI shows an "exhausted" banner and disables the
+        Approve button.
+
+Design invariants (both documented in `blockController.ts` docblock):
+  #1  stepId namespace — inner steps emit under their ORIGINAL stepIds
+      via the ambient bus. "block1" is only used for the wrapping step.*
+      frames + the block.iteration.* frames.
+  #2  context-mutation scope — dry_run runs OUTSIDE the cognitive spread.
+      If you add a new inner step that MUTATES ctx, do NOT place it
+      inside a spread. See CTX SPREAD INVARIANT.
+
+
+================================================================================
+ 5. THE REACT PATTERN (the big one)
+================================================================================
+
+This is the reusable primitive that lets an LLM step call tools in a loop.
+Right now it's applied to ONLY the `retrieve` step. Over time you'll apply
+it to classify, plan, and verify too (per MASTER_PLAN §4.1).
+
+                 createReActStep({ id, goal, tools, maxIterations })
+                            │
+                            │ returns a Mastra step whose execute does:
+                            ▼
+             ┌──────────────────────────────────────────┐
+             │  loop iteration = 0..maxIterations       │
+             │                                          │
+             │     ┌──────────────────────────────┐     │
+             │     │ emit react.iteration.started │     │
+             │     └──────────────────────────────┘     │
+             │                │                         │
+             │                ▼                         │
+             │     ┌──────────────────────┐             │
+             │     │  streamMessage(      │             │
+             │     │    system,           │             │
+             │     │    messages,         │ ← builds user msg
+             │     │    tools,            │   from buildUserMessage
+             │     │    thinkingEnabled   │   callback (which reads
+             │     │  )                   │   ambient priorObservations)
+             │     └──────────────────────┘             │
+             │                │                         │
+             │                │ emits llm.thinking.delta│
+             │                │ emits llm.text.delta    │
+             │                │ emits llm.tool_use.*    │
+             │                ▼                         │
+             │    ┌───────────────────────────┐         │
+             │    │ parseAction(assistant     │         │
+             │    │   message)                │         │
+             │    └───────────────────────────┘         │
+             │                │                         │
+             │       ┌────────┴────────┐                │
+             │       │                 │                │
+             │       ▼                 ▼                │
+             │  final answer?     tool call?            │
+             │       │                 │                │
+             │       ▼                 ▼                │
+             │  emit                dispatchTool(...)   │
+             │  react.iter.             │               │
+             │  completed               ▼               │
+             │    {final:true}      append observation  │
+             │       │                  to messages     │
+             │       │                  array           │
+             │       ▼                  │               │
+             │  RETURN answer      emit react.iter.     │
+             │                     completed            │
+             │                     {observationSummary} │
+             │                          │               │
+             │                          └───▶ next iter │
+             └──────────────────────────────────────────┘
+
+Anatomy of ONE iteration's frame stream (reviewer UI sees this):
+      react.iteration.started { stepId: "retrieve", iteration: 0 }
+         llm.message.started   { model: "sonnet", thinkingEnabled: true }
+         llm.thinking.delta    "I should search runbooks for..."
+         llm.thinking.delta    "...password reset procedures..."
+         llm.text.delta        "Let me call rag.retrieveRunbooks."
+         llm.tool_use.started  { name: "rag_retrieveRunbooks" }
+         llm.tool_use.completed
+         llm.message.completed { stopReason: "tool_use" }
+       tool.started            { name: "rag.retrieveRunbooks" }
+       rag.retrieved           { hits: [3 items] }
+       tool.completed          { durationMs: 116 }
+      react.iteration.completed { final: false,
+                                  toolUsed: "rag_retrieveRunbooks",
+                                  observationSummary: "3 hits, top score 0.76" }
+
+Every frame inside an iteration carries an optional `reactIterationId`
+so the reviewer UI can nest them under a single collapsible row.
+
+Where it lives:
+  The runner                     → src/mastra/lib/reactRunner.ts
+  First (and currently only) use → src/mastra/workflows/triage.ts:
+                                    runRetrieveStep (look for
+                                    `createReActStep({ id: "retrieve" })`)
+
+How to ADD a ReAct step (checklist):
+  1. In `triage.ts`, define `runMyStep` using `createReActStep({...})`.
+  2. Pass it a list of tools from `src/mastra/tools/`.
+  3. Provide `buildSystem` and `buildUserMessage` callbacks — these read
+     from `getRunContext()` to include ticket + prior observations.
+  4. Set `maxIterations` (typically 3-5).
+  5. Register the resulting step in the Mastra workflow chain in the same
+     file (or wrap it in blockController if it's part of Block 1).
+  6. No envelope changes needed — the runner's frames are already wired.
+
+
+================================================================================
+ 6. THE TWO META-LOOPS (human-guided re-planning)
+================================================================================
+
+Beyond the single-step ReAct loop above, the WORKFLOW itself can loop at
+two places when a human asks for it. These are the agent's "conversational"
+surfaces — the product's pitch lives here.
+
+
+6.1  PRE-EXEC REFINE (triggered by reviewer clicking EDIT at review_gate)
+─────────────────────────────────────────────────────────────────────────
+
+                 reviewGateStep (emits review.requested, awaits)
+                           │
+                           ▼
+               ┌─────────────────────────┐
+               │ Reviewer sees the plan  │
+               │ Clicks EDIT + types     │
+               │ "use the Unlock runbook"│
+               └─────────────────────────┘
+                           │
+                           ▼  WS review.decide{decision:"edit",patch.notes:"..."}
+                  bus commits decision
+                           │
+                           ▼
+            reviewGateStep's refine loop kicks in:
+                           │
+                           ├─▶ buildPreGateRefineContext(notes, N)
+                           │      → ["Pre-exec refine 1: reviewer note: ..."]
+                           │
+                           ├─▶ emit block.backtrack.triggered
+                           │      { fromStep:"review_gate", backtrackCount:1 }
+                           │
+                           ├─▶ emit synthetic block1 step.started
+                           │      (so LEFT column updates)
+                           │
+                           ├─▶ runBlock1(ticket, deps, {
+                           │         seedObservations: carriedContext  ← NOTE
+                           │      })                                   ← NOTE
+                           │
+                           │   NOTE: "seedObservations" is how you thread
+                           │   observations INTO Block 1. DO NOT wrap
+                           │   runBlock1 in a withRunContext spread.
+                           │   That pattern was doubly broken and is
+                           │   banned — see CTX SPREAD INVARIANT.
+                           │
+                           ├─▶ emit synthetic block1 step.completed
+                           │      (so LEFT column sees the REFINED plan)
+                           │
+                           ├─▶ emit fresh review.requested
+                           │
+                           └─▶ await next decision
+                                 ├─ approve → proceed to executeStep
+                                 ├─ reject  → terminate run
+                                 └─ edit    → refine again
+                                              (cap MAX_PRE_GATE_REFINES=2;
+                                               3rd edit terminates as reject)
+
+
+6.2  POST-EXEC BACKTRACK (triggered by reviewer REJECTING at human_verify_gate)
+──────────────────────────────────────────────────────────────────────────────
+
+                 humanVerifyGateStep (emits review.requested {post_exec})
+                           │
+                           ▼
+               ┌─────────────────────────┐
+               │ Reviewer sees execute+  │
+               │ verify output. Clicks   │
+               │ REJECT — "this didn't   │
+               │ actually work"          │
+               └─────────────────────────┘
+                           │
+                           ▼
+               humanVerifyGateStep backtrack loop kicks in:
+                           │
+                           ├─▶ buildBacktrackContext(currentVerify, note, N)
+                           │      → ["Backtrack 1: the human rejected the
+                           │          post-execution result.",
+                           │         "Reviewer note: ...",
+                           │         "Prior attempt's execute.stepsRun: 4",
+                           │         "Prior attempt's verify.success: true",
+                           │         "Prior verify evidence: ..."]
+                           │
+                           ├─▶ emit block.backtrack.triggered
+                           │      { fromStep:"human_verify_gate",
+                           │        backtrackCount:1 }
+                           │
+                           ├─▶ synthetic block1 step.started / completed
+                           │      (so LEFT column updates on each backtrack)
+                           │
+                           ├─▶ runBlock1(..., { seedObservations })
+                           │      runReviewGateStep(...)   ← pre-exec gate
+                           │      runExecuteStep(...)      ← browser flow
+                           │      runVerifyStep(...)       ← verify again
+                           │
+                           ├─▶ NEW post-exec review.requested lands
+                           │
+                           └─▶ await next decision
+                                 ├─ approve → run.completed (status=ok)
+                                 ├─ reject  → backtrack again
+                                 │             (cap MAX_BACKTRACKS=2)
+                                 └─ (edit treated as approve — Edit is
+                                    hidden in the UI on post-exec to
+                                    prevent a wedge state)
+
+
+Both loops are structurally symmetric. They use the SAME envelope variant
+(block.backtrack.triggered) discriminated by `fromStep`. They BOTH pass
+observations via runBlock1's `seedObservations` opt, NEVER via a
+withRunContext spread.
+
+
+================================================================================
+ 7. EVENT FLOW — HOW A FRAME TRAVELS FROM EMIT TO UI
+================================================================================
+
+Whenever the agent has something interesting to report (a thought, a tool
+call, a browser screenshot, a decision request), it PUBLISHES a frame.
+Frames are the single channel for everything the UI sees.
+
+      Somewhere in the agent code:
+           bus.publish({ runId, stepId, payload: { type: "llm.thinking.delta", text: "..." } })
+                                │
+                                ▼
+      ┌──────────────────────────────────────────────────────────────┐
+      │  EventBus.publish()                                          │
+      │    1. Get/init per-run state (ring buffer + decision slots)  │
+      │    2. Assign seq = nextSeq++                                 │
+      │    3. Stamp ts = now()                                       │
+      │    4. Validate against frameSchema (Zod discriminated union) │
+      │       IF VIOLATES 16KiB cap or any other schema rule:        │
+      │         → synthesize a run.failed frame, emit that instead   │
+      │    5. Push to ring buffer (evict oldest if full)             │
+      │    6. Emit on EventEmitter channel "run:<runId>"             │
+      │    7. Invoke this.onPersist(frame) (fire-and-forget)         │
+      └──────────────────────────────────────────────────────────────┘
+                                │
+                 ┌──────────────┼──────────────┐
+                 │              │              │
+                 ▼              ▼              ▼
+       ┌───────────────┐ ┌────────────┐ ┌─────────────────┐
+       │ WS subscriber │ │ Postgres   │ │ Any other in-   │
+       │ (openStream   │ │ persist.ts │ │ process         │
+       │  in           │ │            │ │ subscriber      │
+       │ events/stream)│ │ INSERT INTO│ │ (not used today)│
+       │               │ │ events     │ │                 │
+       │ JSON.stringify│ │ with UNIQUE│ │                 │
+       │ + send to WS  │ │ (runId,seq)│ │                 │
+       └───────────────┘ └────────────┘ └─────────────────┘
+                │
+                ▼
+       Reviewer UI (Next.js) renders the frame:
+         • LEFT column — updates the matching <StepOutcome> row
+         • RIGHT column — appends to the <BehaviorFeed>
+
+
+DECISION FLOW (the REVERSE direction — human → agent):
+
+       Reviewer clicks Approve / Reject / Edit in the UI
+                     │
+                     ▼
+       Reviewer UI sends a WS message:
+           { type: "review.decide", decision: "approve",
+             stepId: "review_gate", idempotencyKey: "..." }
+                     │
+                     ▼
+       events/stream.ts  handleReviewDecide()
+                     │
+                     ▼
+       bus.publishClientDecisionForStep(runId, stepId, {
+           decision, by, at, idempotencyKey, patch
+       })
+                     │
+                     ├─▶ emits review.decided frame (fans out just like above)
+                     │
+                     └─▶ wakes the awaiting step via the per-stepId slot:
+                            reviewGateStep was blocked on
+                            `await bus.awaitDecisionForStep(runId, "review_gate")`
+                            — that promise now resolves with the decision
+                            and the step continues.
+
+
+================================================================================
+ 8. KEY FILE INDEX (one-line role, grouped by layer)
+================================================================================
+
+ENTRY LAYER
+  src/index.ts                  bootstraps Hono + WS + graceful shutdown
+  src/http/triage.ts            POST /triage — starts a workflow run
+  src/http/runs.ts              GET /runs/:id + POST /runs/:id/review
+  src/http/static.ts            GET /static/runs/:id/:filename (screenshots)
+  src/http/health.ts            GET /healthz
+  src/events/stream.ts          WS /stream/:runId handler + review.decide routing
+
+ORCHESTRATION LAYER
+  src/mastra/index.ts           Mastra instance + workflow registration
+  src/mastra/workflows/triage.ts  THE file — 9-step workflow + step bodies
+                                 + refine loop + backtrack loop + helpers
+  src/mastra/lib/blockController.ts  Block 1 iteration controller
+  src/mastra/lib/reactRunner.ts      ReAct runner primitive (createReActStep)
+  src/mastra/stepEmitter.ts     translates Mastra step events → env frames
+  src/mastra/runContext.ts      AsyncLocalStorage wrapper + CTX SPREAD INVARIANT
+
+TOOL LAYER
+  src/llm/streamMapper.ts       Anthropic SDK streaming → envelope frames
+                                 (routed through circuit breaker)
+  src/llm/prompts.ts            (system prompts for classify / verify etc.)
+  src/mastra/tools/rag.ts       HTTP client to rag:3009
+                                 (retrieveRunbooks, retrieveSkills)
+  src/mastra/tools/playwrightMcp.ts  Playwright MCP stdio client
+                                      (launchBrowser, BrowserSession)
+
+PRIMITIVES LAYER
+  src/events/envelope.ts        Zod schema for all 30+ frame variants
+                                 (one big discriminated union)
+  src/events/bus.ts             EventBus — ring buffer + per-stepId decisions
+  src/events/persist.ts         Postgres append-only writer
+  src/lib/circuit.ts            circuit breaker (getCircuit by name)
+  src/db/client.ts              drizzle client
+  src/db/schema.ts              runs / events / reviews tables
+  src/db/migrate.ts             boot-time migrations
+  src/env.ts                    Zod-validated process.env
+  src/logger.ts                 pino (with API-key redaction)
+
+
+================================================================================
+ 9. HOW TO EXTEND — COMMON RECIPES
+================================================================================
+
+9.1  ADD A NEW TOOL (e.g., Slack client, ticket-system API, a new RAG index)
+────────────────────────────────────────────────────────────────────────────
+
+  1. Create `src/mastra/tools/<tool>.ts`.
+  2. Implement the tool's functions. Each one should:
+       a. accept `{ runId, bus, stepId }` in its opts (plus whatever else);
+       b. emit `tool.started` with an invocationId + name + args;
+       c. do the actual work (HTTP call / subprocess call / etc.);
+       d. emit `tool.completed` (with resultSummary + durationMs) OR
+          `tool.failed` (with error);
+       e. throw a typed error class on failure.
+  3. If the external service is unreliable, wrap it in a circuit breaker:
+         const breaker = getCircuit("<service-name>");
+         await breaker.execute(() => httpCall(...));
+  4. If you want to use this tool inside a ReAct step, wrap it as a
+     `ReactTool` (see `src/mastra/lib/reactRunner.ts` for the shape)
+     and include it in the tools list passed to `createReActStep`.
+
+
+9.2  ADD A NEW ENVELOPE FRAME VARIANT
+──────────────────────────────────────
+
+  1. In `src/events/envelope.ts`:
+       a. Define the Zod schema for your frame payload (extend
+          `timelineHeader` if it's a regular frame);
+       b. Add it to the `TimelineFrameSchemas` array (or
+          `TransportFrameSchemas` for seq:null frames).
+  2. In the reviewer UI (separate service, `services/test-webapp`):
+       a. If it should render, extend the projection function in
+          `page.tsx` to handle the new `type`;
+       b. Add render component + CSS.
+  3. Any emitter just calls `bus.publish({ ... type: "your.type", ... })`.
+  4. NO envelope-test additions needed for simple additive frames — the
+     size-guard + discriminated-union tests catch schema drift.
+
+
+9.3  ADD A NEW WORKFLOW STEP
+─────────────────────────────
+
+  1. In `src/mastra/workflows/triage.ts`:
+       a. Define the input/output Zod schemas if new;
+       b. Implement an extracted body function `runMyStep(inputData, ...)`
+          — pattern: call `getRunContext()` for {runId, bus}, emit frames
+          around interesting work, return typed output;
+       c. Wrap with `createStep({ id, inputSchema, outputSchema,
+          execute: ({ inputData, abortSignal }) => runMyStep(...) })`;
+       d. Add the step to the `triageWorkflow` chain via `.then(myStep)`;
+       e. Update `StepIdSchema` in envelope.ts with the new stepId.
+  2. The reviewer UI's LEFT column reads `step.completed.output` — if
+     you want a custom body renderer, add a case to `renderXxxBody`.
+
+
+9.4  ADD A NEW HUMAN GATE
+──────────────────────────
+
+  1. Envelope: add your new stepId to `GateStepIdSchema` (the narrow
+     enum used by `clientFrameSchema.review.decide.stepId`).
+  2. Envelope: add the corresponding stepId to `StepIdSchema` too.
+  3. In `triage.ts`, implement the step body:
+         bus.publish({ runId, stepId, payload:
+           { type: "review.requested", plan, screenshots, viewerUrl,
+             requiresApproval: true, reviewHint: "my_phase" } });
+         const decision = await bus.awaitDecisionForStep(runId, "<stepId>");
+         // branch on decision.decision
+  4. Register the new stepId in the workflow chain via `.then(myGate)`.
+  5. In the reviewer UI, add a branch to `<ReviewPanel>` keyed on
+     `pendingReview.reviewHint === "my_phase"`.
+
+
+9.5  APPLY REACT TO AN EXISTING STEP
+─────────────────────────────────────
+
+  E.g., you want `classify` to do RAG lookups during classification.
+  Today it's a one-shot Haiku call.
+
+  1. In `triage.ts`, replace `runClassifyStep`'s body with a
+     `createReActStep({...})` invocation:
+         const runClassifyStep = createReActStep({
+           id: "classify",
+           goal: "Classify the ticket into a category + urgency.",
+           tools: [ragRetrieveCategoryHints],  // from rag.ts
+           maxIterations: 3,
+           buildSystem: () => "...",
+           buildUserMessage: () => {
+             const ctx = tryGetRunContext();
+             return observationsPrefix(ctx?.priorObservations) +
+                    `Ticket: ${ctx?.ticket?.subject}`;
+           },
+           parseFinal: (text) => { ... },  // parse JSON, return { category, ... }
+         });
+  2. That's it. The existing envelope frames (react.iteration.*) already
+     render in the UI. No frontend changes needed.
+
+
+9.6  HARDEN A NEW EXTERNAL INTEGRATION
+───────────────────────────────────────
+
+  1. Pick a singleton name: `const breaker = getCircuit("<name>")`.
+  2. Wrap every external call through it:
+         await breaker.execute(() => fetch(...), { abortSignal });
+  3. The circuit breaker handles exponential backoff + open/half-open
+     state transitions AUTOMATICALLY. State changes log at
+     `event: circuit_breaker.state_change` — future PagerDuty hook.
+
+
+================================================================================
+10. WHERE TO OPTIMIZE LATER (pointers for future cycles)
+================================================================================
+
+Not blockers — just "here's where you'd look" when the time comes.
+
+  • PROMPTS: every LLM prompt is a string in `triage.ts`. Centralizing them
+    into `src/llm/prompts.ts` with versioning + A/B hooks is Week-3-ish.
+
+  • SKILL CARDS (Week 2): replace the hardcoded Jane password-reset flow in
+    `runDryRunStep` / `runExecuteStep` with a YAML-driven skill-card
+    executor. Schema sketch in MASTER_PLAN §3.2.
+
+  • REACT EVERYWHERE (Week 2): apply `createReActStep` to classify / plan /
+    verify (today only retrieve uses it). See §9.5.
+
+  • SESSION REPLAY (Week 4): the `events` table is already append-only. A
+    "replay a past run" harness reads from there and re-emits on a mock
+    bus for eval regression tests.
+
+  • EVALS (Week 4): three-layer harness — deterministic assertions on
+    step outputs, LLM-judge on plan quality, regression against past
+    fixtures.
+
+  • CIRCUIT BREAKER USERS: today only the Anthropic SDK call is wrapped.
+    `rag.ts` has its own `p-retry` — unify when convenient. Playwright
+    MCP calls are not wrapped (different failure mode).
+
+  • OBSERVABILITY: `/metrics` endpoint + per-step token/cost tracking
+    lives as Week-4 scope in MASTER_PLAN.
+
+
+================================================================================
+11. INVARIANTS TO REMEMBER (the things that bite if broken)
+================================================================================
+
+  1. FRAMES ARE THE SOURCE OF TRUTH. If the UI needs to know something,
+     emit a frame for it. Do not smuggle data through side channels.
+
+  2. CTX SPREAD INVARIANT. `withRunContext({ ...ctx, <override> }, fn)`
+     creates a NEW object. Mutations in `fn` are LOST. Specifically:
+     NEVER wrap `runBlock1` in such a spread. Thread observations via
+     `runBlock1(..., { seedObservations })` instead. (Full rules in the
+     docblock at the top of `runContext.ts`.)
+
+  3. STEPID NAMESPACE. Extracted step bodies invoked OUTSIDE Mastra's
+     engine (Block 1 controller, refine loop, backtrack loop) must emit
+     their own `step.started` / `step.completed` frames manually. The
+     stepEmitter only fires for Mastra-invoked steps.
+
+  4. 16 KIB FRAME CAP. No frame may exceed MAX_FRAME_BYTES. Large payloads
+     (screenshots, full plan text) must be persisted to disk/DB and
+     referenced by path in the frame. Bus synthesizes a `run.failed` if
+     violated.
+
+  5. BUS DECISION SLOTS ARE PER-STEPID. `awaitDecisionForStep(runId,
+     stepId)` — NOT the deprecated single-slot `awaitDecision(runId)`.
+     This is what enables the two-gate architecture.
+
+  6. DB CROSS-CHECK IS AUTHORITATIVE, NOT THE WIRE. A run that reports
+     `status=ok` on the WS stream might still have stepsRun=0 + Jane's
+     row unchanged. Smoke acceptance requires querying Postgres or the
+     actual target system. (See STARTUP_PROCESS §1.6.7.)
+
+================================================================================
+ END
+================================================================================

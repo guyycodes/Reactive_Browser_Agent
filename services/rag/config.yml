@@ -1,0 +1,39 @@
+agent:
+  model_name: guymorganb/e5-large-v2-4096-lsg-patched
+  embedding_model:
+    batch_size: 32
+    device: cpu
+    max_tokens: 4096
+    timeout: 60
+    will_embed_docs: true
+  query_model:
+    device: cpu
+    max_tokens: 4096
+    timeout: 60
+    top_k: 5
+esg_pas_model: en_core_web_trf
+extract:
+  esg: true
+  pas: true
+processed_output_dir: src/util/clean_docs
+dirty_documents:
+  base_dir: src/util/dirty_documents
+  docx: docx
+  html: html
+  other: other
+  pdf: pdf
+  temp: temp
+qdrant:
+  collection: document_vectors
+  cloud_host: cloud-endpoint
+  cloud_port: 443
+  cloud_api_key: ''
+  prefer_grpc: false
+  dimension: 1024
+  host: qdrant
+  mode: LOCAL
+  port: 6333
+  timeout: 300
+text_splitter:
+  chunk_overlap: 10
+  chunk_size: 300

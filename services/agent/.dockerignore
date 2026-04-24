@@ -1,0 +1,41 @@
+# What stays OUT of the agent Docker image.
+# Build context is services/agent/ (per docker-compose.yml).
+#
+# Root .dockerignore at the repo root covers whole-stack-wide excludes
+# (node_modules, .env, docs/, etc.). This file adds agent-service-specific
+# excludes + repeats the critical .env / node_modules rules for safety in
+# case a future build context ever widens to the repo root.
+
+# --- Secrets ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Dependencies + build artifacts ------------------------------------------
+node_modules
+dist
+*.tsbuildinfo
+coverage
+
+# --- Git / docs / local dev files (never belong in an image) -----------------
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+*.md
+
+# --- Runtime artifacts -------------------------------------------------------
+.playwright-videos
+*.log
+*.pid
+
+# --- Dev-only scripts not needed at runtime -----------------------------------
+# probe-screenshot.mjs is a one-off devtool probe; excluded from prod image.
+probe-screenshot.mjs
+
+# --- OS / editor cruft --------------------------------------------------------
+.DS_Store
+.vscode
+.idea
+*.swp

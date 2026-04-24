@@ -1,0 +1,36 @@
+# Pinned ranges to keep the LSG-patched BERT model loading cleanly.
+# transformers 4.46+ adds a torch>=2.6 CVE check; 5.x removes attributes our
+# model code depends on. qdrant-client 1.13+ dropped the .search() method the
+# controllers use.
+accelerate<2
+aiofiles
+docx2txt
+fastapi
+fpdf2
+huggingface-hub<1.0
+pillow
+pdfplumber
+pyyaml
+PyMuPDF
+pydantic
+python-dotenv
+python-docx
+python-multipart
+qdrant-client<1.13
+questionary
+requests
+safetensors<0.5
+sentence-transformers<5
+tiktoken
+tokenizers<0.22
+torch>=2.6,<2.8
+torchaudio>=2.6,<2.8
+torchvision>=0.21,<0.23
+transformers>=4.46,<5
+uvicorn
+watchfiles
+nltk
+sentencepiece
+beautifulsoup4
+spacy[all]
+https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.3/en_core_web_trf-3.7.3-py3-none-any.whl

@@ -1,0 +1,42 @@
+# What stays OUT of the rag Docker image.
+# Build context is services/rag/ (per docker-compose.yml).
+
+# --- Virtual environment ------------------------------------------------------
+pipeline_311/
+
+# --- Python caches ------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Git / docs / local dev files (never belong in an image) -----------------
+.git/
+.gitignore
+.dockerignore
+dockerfile
+Dockerfile
+README.md
+Readme.md
+*.md
+
+# --- Secrets ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Logs + temporary files ---------------------------------------------------
+*.log
+*.swp
+*.swo
+*.pid
+
+# --- OS-specific files --------------------------------------------------------
+.DS_Store
+
+# --- Other build artifacts ----------------------------------------------------
+build/
+dist/

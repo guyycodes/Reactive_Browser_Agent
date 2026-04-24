@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>System Status Check Before Escalation</title></head>
+<body>
+<h1>Runbook: System Status Check</h1>
+<p><strong>Category:</strong> system_status &nbsp; <strong>Urgency:</strong> low &nbsp; <strong>Target app:</strong> internal-admin-portal</p>
+<h2>When to use</h2>
+<p>Run this check before escalating any ticket that mentions "the system is down", "cannot log in", or "the app is broken". Many such reports are caused by ongoing incidents that are already known.</p>
+<h2>Procedure</h2>
+<ol>
+  <li>Navigate to <code>/status</code> in the Internal Admin Portal.</li>
+  <li>Check the component health indicators: <em>auth</em>, <em>database</em>, <em>mail</em>, <em>external identity provider</em>.</li>
+  <li>If any component shows <code>degraded</code> or <code>down</code>, note the incident ID displayed on the status page.</li>
+  <li>Post the incident ID in the ticket and tell the user the issue is being tracked. Do not escalate for confirmed ongoing incidents.</li>
+  <li>If all components are <code>healthy</code>, continue with normal troubleshooting per the user's original report.</li>
+</ol>
+<h2>Postconditions</h2>
+<p>Either the ticket is resolved with an incident reference, or the status check is recorded and normal triage continues.</p>
+</body></html>

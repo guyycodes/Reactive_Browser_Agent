@@ -1,0 +1,50 @@
+# docker run --rm -d \
+#   --network rewrite_agent_311-089dcb9f80df4c2e6cb23d54d634777921d2d0a70d1dd2f2a667ac725d6f6c79_default \
+#   -p 5900:5900 \
+#   --name socat-proxy \
+#   alpine/socat \
+#   tcp-listen:5900,fork,reuseaddr tcp-connect:rewrite_agent_311-089dcb9f80df4c2e6cb23d54d634777921d2d0a70d1dd2f2a667ac725d6f6c79-langgraph-api-1:5900
+
+
+# # Run the container, publishing 6080 to the host so your browser can reach noVNC
+# docker run --rm \
+#     --network rewrite_agent_311-089dcb9f80df4c2e6cb23d54d634777921d2d0a70d1dd2f2a667ac725d6f6c79_default \
+#     -p 6080:6080 \
+#     --name side_car_container \
+#      agent_sidecar_311-app:latest 
+
+FROM ubuntu:22.04
+
+# 1. Install dependencies
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip socat wget unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Install noVNC + websockify in /opt/novnc
+RUN mkdir -p /opt/novnc
+WORKDIR /opt/novnc
+# Grab a specific version of noVNC, e.g. v1.4.0
+RUN wget https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip -O noVNC.zip \
+    && unzip noVNC.zip \
+    && mv noVNC-1.4.0/* . \
+    && rm -rf noVNC-1.4.0 noVNC.zip
+
+# Download websockify (dependency for noVNC)
+RUN mkdir -p /opt/novnc/utils/websockify
+WORKDIR /opt/novnc/utils/websockify
+RUN wget https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.zip -O websockify.zip \
+    && unzip websockify.zip \
+    && mv websockify-0.11.0/* . \
+    && rm -rf websockify-0.11.0 websockify.zip
+
+# 3. Copy your Python + shell scripts into /app
+WORKDIR /app
+COPY . /app
+RUN pip3 install --no-cache-dir -r requirements.txt || true
+
+# Expose the VNC port (5900) and the noVNC port (6080).
+EXPOSE 5900
+EXPOSE 6080
+
+# Run your main.py
+CMD ["python3", "/app/main.py"]

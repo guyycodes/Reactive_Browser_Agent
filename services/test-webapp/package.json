@@ -1,0 +1,23 @@
+{
+  "name": "@browser-agent/test-webapp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Week 1A reviewer UI + Week 1B target webapp. Next.js 14 app router, single-page reviewer at /agent/review/[runId]; full user-management surface lands in 1B.",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "next": "14.2.35",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "typescript": "^5.7.2"
+  }
+}

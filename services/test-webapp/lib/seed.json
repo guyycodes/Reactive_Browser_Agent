@@ -1,0 +1,22 @@
+[
+  { "id": "u-001", "email": "jane@example.com",     "name": "Jane Cooper",       "status": "locked",    "department": "Finance",      "lastLogin": "2026-04-18T14:22:00Z" },
+  { "id": "u-002", "email": "alex@example.com",     "name": "Alex Rivera",       "status": "active",    "department": "Engineering",  "lastLogin": "2026-04-22T08:05:00Z" },
+  { "id": "u-003", "email": "priya@example.com",    "name": "Priya Shah",        "status": "active",    "department": "Product",      "lastLogin": "2026-04-21T19:41:00Z" },
+  { "id": "u-004", "email": "marcus@example.com",   "name": "Marcus Lee",        "status": "suspended", "department": "Sales",        "lastLogin": "2026-04-10T11:30:00Z" },
+  { "id": "u-005", "email": "dana@example.com",     "name": "Dana Okafor",       "status": "active",    "department": "Legal",        "lastLogin": "2026-04-22T09:15:00Z" },
+  { "id": "u-006", "email": "sam@example.com",      "name": "Samira Haddad",     "status": "active",    "department": "Engineering",  "lastLogin": "2026-04-22T10:55:00Z" },
+  { "id": "u-007", "email": "leo@example.com",      "name": "Leo Takahashi",     "status": "locked",    "department": "Engineering",  "lastLogin": "2026-04-19T16:02:00Z" },
+  { "id": "u-008", "email": "nadia@example.com",    "name": "Nadia Petrov",      "status": "active",    "department": "HR",           "lastLogin": "2026-04-22T07:12:00Z" },
+  { "id": "u-009", "email": "omar@example.com",     "name": "Omar Chen",         "status": "active",    "department": "Finance",      "lastLogin": "2026-04-20T13:44:00Z" },
+  { "id": "u-010", "email": "riley@example.com",    "name": "Riley Thompson",    "status": "active",    "department": "Marketing",    "lastLogin": "2026-04-22T06:30:00Z" },
+  { "id": "u-011", "email": "kenji@example.com",    "name": "Kenji Watanabe",    "status": "active",    "department": "Engineering",  "lastLogin": "2026-04-21T22:05:00Z" },
+  { "id": "u-012", "email": "maria@example.com",    "name": "Maria Delgado",     "status": "locked",    "department": "Support",      "lastLogin": "2026-04-17T09:20:00Z" },
+  { "id": "u-013", "email": "theo@example.com",     "name": "Theo Andersen",     "status": "active",    "department": "IT",           "lastLogin": "2026-04-22T11:48:00Z" },
+  { "id": "u-014", "email": "yasmin@example.com",   "name": "Yasmin Al-Farsi",   "status": "active",    "department": "Product",      "lastLogin": "2026-04-22T08:33:00Z" },
+  { "id": "u-015", "email": "ben@example.com",      "name": "Benjamin Park",     "status": "suspended", "department": "Engineering",  "lastLogin": "2026-03-28T15:15:00Z" },
+  { "id": "u-016", "email": "sofia@example.com",    "name": "Sofia Greco",       "status": "active",    "department": "Design",       "lastLogin": "2026-04-22T09:50:00Z" },
+  { "id": "u-017", "email": "ravi@example.com",     "name": "Ravi Kumar",        "status": "active",    "department": "Engineering",  "lastLogin": "2026-04-21T17:22:00Z" },
+  { "id": "u-018", "email": "hannah@example.com",   "name": "Hannah Lindqvist",  "status": "active",    "department": "Finance",      "lastLogin": "2026-04-22T10:10:00Z" },
+  { "id": "u-019", "email": "diego@example.com",    "name": "Diego Martínez",    "status": "locked",    "department": "Sales",        "lastLogin": "2026-04-20T14:38:00Z" },
+  { "id": "u-020", "email": "chloe@example.com",    "name": "Chloé Dubois",      "status": "active",    "department": "Legal",        "lastLogin": "2026-04-22T07:55:00Z" }
+]

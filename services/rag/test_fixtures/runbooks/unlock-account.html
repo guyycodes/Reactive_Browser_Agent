@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Unlock Account After Failed Login Attempts</title></head>
+<body>
+<h1>Runbook: Unlock a Locked Account</h1>
+<p><strong>Category:</strong> account_unlock &nbsp; <strong>Urgency:</strong> medium &nbsp; <strong>Target app:</strong> internal-admin-portal</p>
+<h2>Preconditions</h2>
+<ul>
+  <li>User account must be in status <code>locked</code>. If status is <code>suspended</code> or <code>disabled</code>, escalate to tier-2 — do not unlock.</li>
+  <li>Verify the identity of the requester by matching the ticket email header or by callback to the phone number on file.</li>
+  <li>Confirm the lock is due to failed login attempts (lock reason: <code>too_many_failed_attempts</code>), not a security hold.</li>
+</ul>
+<h2>Procedure</h2>
+<ol>
+  <li>Navigate to <code>/users</code>.</li>
+  <li>Search for the affected user.</li>
+  <li>Open the user detail view. Confirm <code>lock_reason = too_many_failed_attempts</code>.</li>
+  <li>Click "Unlock Account". The failed-attempt counter resets to zero and status returns to <code>active</code>.</li>
+  <li>Notify the user in the ticket: they can log in again; recommend a password reset if they cannot remember the password.</li>
+</ol>
+<h2>Postconditions</h2>
+<p>User record status is <code>active</code>. Failed-attempt counter is <code>0</code>. Ticket updated with resolution note.</p>
+</body></html>

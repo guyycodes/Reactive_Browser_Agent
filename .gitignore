@@ -1,0 +1,80 @@
+# ============================================================================
+#  NEVER COMMIT
+# ============================================================================
+#
+#  Any file matching the patterns below MUST stay local. The `.env` rule is
+#  load-bearing — `.env` at the repo root carries the real ANTHROPIC_API_KEY,
+#  HF_TOKEN, and TARGET_APP_PASSWORD. `.env.example` is the tracked template
+#  (empty secret values) and is explicitly kept via the negation at the
+#  bottom of this file.
+#
+#  Before the first `git push`, run:
+#     git ls-files --error-unmatch .env 2>&1 | grep -q 'did not match' \
+#       && echo "OK: .env not staged" || echo "LEAK: .env is staged"
+#
+#  For Dockerfile exclusions (what does NOT get copied into images), see
+#  .dockerignore at the repo root + the per-service .dockerignore files.
+# ============================================================================
+
+# --- Secrets / local config ---------------------------------------------------
+.env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+
+# --- Dependencies / build artifacts -------------------------------------------
+node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# --- Runtime caches -----------------------------------------------------------
+.cache/
+.eslintcache
+.turbo/
+coverage/
+.nyc_output/
+tmp/
+*.pid
+
+# --- Logs + test output -------------------------------------------------------
+*.log
+logs/
+.playwright-videos/
+playwright-report/
+test-results/
+
+# --- Defensive: stray screenshots outside --output-dir ------------------------
+# Screenshots must land under `/workspace/.playwright-videos/<runId>/`
+# (the agent's named volume). If a regression ever causes @playwright/mcp to
+# resolve `filename` relative to its CWD (the agent package root) again — as
+# happened in 6b-hotfix-4 — a stray `services/agent/*.png` will at least stay
+# out of commits. The real fix (absolute path in takeScreenshot's mcpArgs)
+# landed in 6b-hotfix-5; this keeps the blast radius small if it regresses.
+services/agent/*.png
+
+# --- OS / editor cruft --------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Python (services/rag + services/browser-viewer) -------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+services/rag/pipeline_311/
+
+# --- Explicit keeps (override any above pattern) ------------------------------
+!.env.example
+!services/agent/.dockerignore
+!services/rag/.dockerignore
+!services/test-webapp/.dockerignore

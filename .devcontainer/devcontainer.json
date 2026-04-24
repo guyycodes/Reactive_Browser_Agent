@@ -1,0 +1,36 @@
+{
+  "name": "Browser Agent (compose)",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "agent",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "bradlc.vscode-tailwindcss"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "forwardPorts": [3001, 3009, 6080, 6333, 5432, 9229],
+  "portsAttributes": {
+    "3001": { "label": "agent (Mastra HTTP/WS)", "onAutoForward": "notify" },
+    "3009": { "label": "rag (FastAPI)", "onAutoForward": "silent" },
+    "6080": { "label": "browser-viewer (noVNC)", "onAutoForward": "openBrowser" },
+    "6333": { "label": "qdrant (HTTP)", "onAutoForward": "silent" },
+    "5432": { "label": "postgres", "onAutoForward": "silent" },
+    "9229": { "label": "node inspect", "onAutoForward": "silent" }
+  },
+  "postCreateCommand": "git config --global --add safe.directory /workspace && echo 'agent container ready. compose services: qdrant, postgres, rag, agent, browser-viewer' "
+}

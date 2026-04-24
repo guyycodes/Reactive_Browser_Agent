@@ -1,0 +1,367 @@
+# Browser Agent — Unified Master Plan
+
+Tier-1 IT triage agent that **controls a real browser** to execute resolutions, gated by human review, retrieval-augmented by a runbook + skill-card knowledge base, and fully auditable.
+
+This plan merges two existing assets with the agentic architecture into a single, executable roadmap:
+
+- **`docs_pipeline_311`** — existing Python FastAPI + Qdrant RAG service (e5-large, 1024-dim, 4096 max tokens). We **reuse it as-is** via HTTP; we do not re-implement embeddings in TypeScript.
+- **`agent_sidecar_311`** — existing socat + noVNC bridge. We **adopt the pattern** to stream a headful browser session into a reviewer UI.
+- **This repo (`browser_agent`)** — Mastra + Playwright MCP agent, running inside the dev container we've already scaffolded.
+
+## Progress
+
+| Phase | Status | Summary |
+|---|---|---|
+| **Phase 0 — Unified scaffolding** | ✅ **Complete & verified** | 6 services on `agent-net` (bridge `172.28.0.0/16`), all healthchecks green, all host-published ports responding. See [`ARCHITECTURE.md`](../ARCHITECTURE.md). |
+| **Phase 0.5 — RAG foundation** | ✅ **Complete & verified end-to-end** | HF model patched + pushed; pipeline runs drop → clean → embed → upsert; per-document UUID-named collections with append semantics; concurrency-safe (lock + 409 tolerance + UUID point IDs). Smoke: 6 concurrent drops → correct `3+1+1+1` distribution. |
+| **Pre-Week-1 — Streaming LLM thoughts design** | ✅ **Reviewed & approved** | Reference code from the user's prior LangGraph project reviewed. Pattern translated to Mastra + Anthropic native thinking blocks. Envelope schema, WS route shape, step-interleaving, and Week-1 scaffold plan all locked in. |
+| **Week 1A — Commit 1 of 3: transport + persistence** | ✅ **Approved (build green)** | Event envelope (24 variants, 16 KiB guard, seq:null transport frames), EventBus with ring buffer + idempotent decisions, Origin-allowlisted WS stream handler, Postgres schema (`runs/events/reviews` with `UNIQUE(idempotency_key)`), 38-test unit suite. `npm run check` passes (`tsc --noEmit` 0 errors + 38/38 vitest). Post-review type-soundness fixes landed via `DistributivelyOmit` + `runId` guard + engine range widened to `>=20.20 <25`. |
+| **Week 1A — Commit 2 of 3: LLM + Mastra** | ✅ **Approved (build green)** | `@anthropic-ai/sdk` 0.90.0 pinned, streamMapper with UTF-8-aware 8 KiB chunking, 8-step Mastra workflow wired (`classify`/`plan`/`verify` real; `retrieve`/`dry_run`/`execute`/`log_and_notify` canned with synthetic frames; `review_gate` via `bus.awaitDecision`). `AsyncLocalStorage<RunContext>` plumbs `{runId, bus}` into every step. 6 new streamMapper tests pass; `npm run check` → 44/44, tsc 0 errors. `ARCHITECTURE.md §2.1` updated. Two non-blocking fixups carried to Commit 3 / Week 2: orphan `tool.started` on reject path, and regex-based `destructive` detection. |
+| **Week 1A — Commit 3 of 3: reviewer UI** | ✅ **Approved — Week 1A complete** | `services/test-webapp/` new service: Next.js 14 App Router, single-page `/agent/review/[runId]` with WS client, step-card timeline, pulsing thinking bubble, sticky approve/reject panel (idempotency keys on every decision). Orphan `tool.started` from reject path dropped in the same commit. `npm run check` green (44/44), `next build` clean, 7-service compose up `--wait` fully healthy, both test-webapp routes return 200. |
+| **Week 1B — Commit 4: test-webapp admin surface** | ✅ **Approved** | Next.js bumped to `14.2.35` (14 accumulated CVE fixes). `/login` + `/users` (search) + `/users/:id` + `/users/:id/reset-password` (checkbox-confirm destructive gate) + `/status` (8 widgets: 6 ok, 1 warn, 1 err). Session-gated `(auth)` route group, cookie sessions via `next/headers`. 20 seeded users including `jane@example.com` starting as `locked`; `data-testid` on every interactive element for the Week 1B Playwright driver. |
+| **Week 1B — Commit 5-prep: rag response shape** | ✅ **Approved** | `query_model.qa_search_with_hits` + `deep_semantic_search_with_hits` added; `/qa` + `/semantic` controllers return `{docs, hits[{id, score, text, source, chunk_id}], request_id, elapsed_seconds}`. Back-compat preserved for `configurator.py` via `List[str]` wrappers. **Commit 5-prep addendum** landed `except HTTPException: raise` in both endpoints so nonexistent-collection returns clean HTTP 404 (was wrapping as 500). Happy + sentinel + empty + 404 paths all re-verified. |
+| **Week 1B — Commit 5a: `rag.ts` TS client** | ✅ **Approved** | `services/agent/src/mastra/tools/rag.ts` with exponential backoff (`p-retry@6.2.1`, 500 ms → 15 s, factor 2, 90 s `AbortSignal` deadline), 404 → empty-envelope translation, Zod validation at tool boundary, `RagClientError` / `RagSchemaError` error taxonomy. 7 new vitest cases (happy / sentinel / 404 / retry-on-5xx-then-success / deadline-hit / schema-violation / config-contract) → **51/51 total** tests passing. |
+| **Week 1B — Commit 5b: real `retrieveStep`** | ✅ **Approved** | `src/mastra/workflows/triage.ts:retrieveStep` body swapped from canned to real RAG. Emits 6 envelope frames per run (two `tool.started → rag.retrieved → tool.completed` triplets, runbooks + skills) with real scores, source paths, `request_id` round-tripped from rag. `hitCount` from `hits.length` so sentinel-doc paths report 0. `tool.failed` replaces the success triplet on error with soft-failure fallthrough to `planStep`. Live smoke: full 76-frame timeline, 3 runbook hits + skills 404→empty, `run.completed status=ok`, zero orphan spans. |
+| **Week 1B — Commit 6a: Playwright MCP client wrapper** | ✅ **Approved** | `services/agent/src/mastra/tools/playwrightMcp.ts` on raw `@modelcontextprotocol/sdk@^1.29.0` + pinned `@playwright/mcp@0.0.70`. `launchBrowser({runId, bus, stepId, signal})` returns a `BrowserSession` with navigate/snapshot/click/fillForm/takeScreenshot/consoleMessages/close. Tree-kill on close (ps + BFS + SIGKILL leaf-first) so Chromium can't orphan to PPID=1. Four injectable hooks (`clientFactory` / `transportFactory` / `killProcessTreeImpl` / `fsImpl`) for dependency-free unit tests on spawn args + teardown. |
+| **Week 1B — Commit 6b: real `dryRunStep` + `executeStep`** | ✅ **Approved** | Canned browser bodies swapped for real Playwright MCP. `RunContext.browser` carries the logged-in session from dry_run → execute so the reviewer gate doesn't force a re-login. `findRefByAccessibleName` + `findRefForRole` resolve Playwright accessibility-tree refs by role-filtered substring match (catches the `/login` heading-vs-button "Sign in" ambiguity, the `/users` searchbox-vs-button "Search" ambiguity, and the reset-confirm heading-vs-button "Reset password" ambiguity). Checkbox toggled via `session.click` (MCP handles the DOM event correctly). Hotfixes 1–5 landed alongside: `--browser chromium` spawn flag, `filename` absolute-path (MCP resolves relative against CWD not `--output-dir`), `browser_fill_form` schema `{name, type, ref, value}`, `extractUserStatus` anchored regex for the status badge (avoids matching MCP's root `[active]` focus marker), stray-PNG cleanup + `.gitignore` entry. |
+| **Week 1B — Commit 6c: reviewer UI screenshot rendering** | ✅ **Approved** | Three surgical pieces: (1) per-run `--user-data-dir` at `${runDir}/.mcp-profile` so back-to-back runs don't bleed session cookies; `session.close()` now also `fs.rm`-cleans the profile dir. (2) `GET /static/runs/:runId/:filename` Hono route in `src/http/static.ts` with four-layer path defense — Zod UUID runId, `[A-Za-z0-9][A-Za-z0-9._-]*` filename whitelist, extension whitelist (`png`/`jpeg`/`yml`/`log`), final `path.resolve + startsWith` containment; `Cache-Control: private, max-age=3600`; injectable `fsImpl` for tests. (3) Next.js `rewrites()` in `services/test-webapp/next.config.mjs` proxies `/api/static/runs/:runId/:filename` to the agent; `FrameRow` renders inline `<img>` thumbnails (480×320 cap, click-to-full-size via `<a target="_blank">`, `loading="lazy"`) for every `browser.screenshot` frame. Step-card headers gained `role="button"` / `tabIndex={0}` / Enter+Space keyboard handlers for a11y. |
+| **Week 1B — Commit 7a.i: single-image screenshot rail** | ✅ **Approved** | First cut of a pinned "live view" rail at top-right of the reviewer page showing the most recent `browser.screenshot` frame at 480 × auto. Grid sidebar + sticky inside the column + cross-fade on shot-swap + 30 s ring-buffer eviction caveat documented. Subsequently **absorbed into 7a.ii's behavior feed** — no standalone rail code remains; the `/api/static/runs/:runId/:filename` rewrite and `basename()` helper carry forward. |
+| **Week 1B — Commit 7a.ii: behavior-feed IA refactor** | ✅ **Approved** | Pivoted from "spotlight view" to "brain feed." Split the reviewer page into a two-column grid: LEFT `.review-outcomes-col` renders one compact `<StepOutcome>` row per workflow step distilled from `step.completed.output`; RIGHT `.review-feed-col` renders a chronological `<BehaviorFeed>` of every `llm.*` / `tool.*` / `rag.retrieved` / `browser.*` frame with inline step dividers. Auto-scroll with stick-to-bottom + 3 s idle gesture. Orphan-`rag.retrieved` fallback renders as a standalone `feed-tool.pending` card when no paired `rag.*` tool span is open — defensive UI branch so hits never silently disappear on envelope-ordering edge cases. Pure client-side IA refactor; agent untouched. |
+| **Week 1B — Commit 7a.iii: fixed-viewport shell + resizable divider + scroll anchor** | ✅ **Approved** | Promoted `<main>` to `.review-page { height: 100vh; overflow: hidden }` so the page body never scrolls; both columns became independent `overflow-y: auto` scroll containers. Hand-rolled grid-driven resizable divider between columns via CSS `--left-pct` custom property; clamp `[20, 80]`; `localStorage` persistence under `"reviewLeftPct"`; `setPointerCapture` drag + ArrowLeft/Right ±2 % keyboard support + ARIA `role="separator" aria-orientation="vertical" aria-valuenow/min/max`. Initial top-third scroll anchor via `padding-bottom: 66vh` on `.behavior-feed` (superseded in 7a.v). Added `--accent-rgb: 106, 169, 255` theme token for future pulse animations. |
+| **Week 1B — Commit 7a.iv: implicit post-action screenshots** | ✅ **Approved** | Agent-side only. `services/agent/src/mastra/tools/playwrightMcp.ts` wraps `session.click` and `session.fillForm` so after a successful MCP call returns, a follow-up `takeScreenshot("${mcpToolName}:after")` fires via a closure-local `doTakeScreenshot()` helper that's shared with the public `takeScreenshot` method (TDZ-safe — avoids the forward-reference trap of calling `session.takeScreenshot` from before the object is constructed). Failures downgrade to `logger.debug` — never poison a successful click. Bumps PNG count per happy-path run from 6 → ~12–15 and makes the behavior feed refresh at ~1 frame per user-visible browser action during `execute`. Test count 86 → **87** — existing `[8]` fillForm test amended for the +1 screenshot call, new `[12]` asserts the `:after` label convention and absolute-path filename contract. |
+| **Week 1B — Commit 7a.v: agentic polish (closes 7a series)** | ✅ **Approved** | Five interacting features landed together as one coherent commit (per handoff — treating them as independent landed-sequentially was the wrong call since they all drive one "feels agentic" outcome). (1) **Scroll-anchor upgrade** — deleted `padding-bottom: 66vh`, added `.behavior-feed > * { scroll-margin-top: 33vh }`, replaced `scrollTop = scrollHeight` with `lastElementChild?.scrollIntoView({block: "start"})` so growing typewriter text fills downward from a deterministic anchor line regardless of frame height. (2) **Typewriter on `llm.text.delta`** — 60 cps fixed-rate char pump with catchup scaling when >50 chars behind the wire (Sonnet's token-burst pattern); flushes on `llm.message.completed`; `.text-block.typing::after` blinking `▊` caret in accent blue. (3) **Thinking bubble fade** — on `llm.message.completed`, the purple thinking block collapses via a CSS grid `1fr → 0fr` transition (200 ms, modern evergreen Baseline as of Q4 2023) to a pill `[sonnet] thought for 7.2s · click to expand`; click-to-expand, click-"collapse" inside expanded to re-collapse. (4) **Tool-card pulse** — `@keyframes toolPulse` emits a breathing accent-blue `box-shadow` around `.feed-tool.pending .marker` via `rgba(var(--accent-rgb), ...)` (the token from 7a.iii earns its keep); stops automatically when the card flips to `.ok` / `.err`. (5) **Active-step autoscroll in the LEFT column** — on each new `step.started` transition, the matching `.step-outcome` row auto-scrolls into view with `block: "nearest"`; gated by a separate `lastOutcomesInteractionAt` ref so interactions in one column don't bail auto-scroll in the other. |
+| **Week 1B — Commit 7a-docs-sync** | ✅ **Approved** | Same 5c / 6c-4 precedent — README / ARCHITECTURE §2.1 + §2.7 / STARTUP_PROCESS §1.6 / MASTER_PLAN all reflect the landed 7a series + the revised 7b scope. Surfaced during 7a.v smoke: a transient Anthropic 500 in `verifyStep` killed the run; UI rendered the failure truthfully but the absence of retry on `streamMessage` is a pre-existing gap that Commit 7b.i now addresses before the ReAct runner lands. |
+| **Week 1B — Commit 7b.i: circuit breaker + Anthropic wrap + listener fix** | ✅ **Approved** | New reusable primitive at `services/agent/src/lib/circuit.ts`: named-instance registry (`getCircuit("anthropic")` singleton per name), three-state machine (closed → open → half-open) with sliding failure window + cooldown + single-probe recovery, composed retry-on-5xx with exponential backoff, pager-ready state-change logging via pino (`event: circuit_breaker.state_change`). First consumer: `streamMapper.ts` routes every Anthropic SDK streaming call through `getCircuit("anthropic")` — every `classify` / `plan` / `verify` invocation + every ReAct iteration becomes resilient to API flake. Second fix: `setMaxListeners(32, opts.signal)` in `launchBrowser`. Test count 87 → **98**. |
+| **Week 1B — Commit 7b.ii: `createReActStep` runner + `retrieveStep` refactor** | ✅ **Approved** | Reusable `createReActStep({ id, goal, tools, maxIterations })` Mastra step factory at `src/mastra/lib/reactRunner.ts`, running think → tool → observe → think. New envelope variants `react.iteration.started` / `react.iteration.completed` with optional `reactIterationId` on `llm.*` / `tool.*` / `rag.retrieved` / `browser.*` frames emitted inside an iteration, so reviewer UI nests them. `retrieveStep` refactored to use it (think → targeted RAG → observe → refine). Runner's internal `withRunContext` uses the `{ ...ctx, bus: taggedBus }` spread pattern (verified by `reactRunner.test.ts [8]`) to preserve ambient `priorObservations`. Test count 98 → **110**. |
+| **Week 1B — Commit 7b.ii hotfixes 1-4** | ✅ **Approved** | Four tightly-scoped follow-ups: ticket plumbed onto RunContext (planStep needs ticket.subject), `RetrievalSchema.hits` carries real preview text (not just counts), structured `PlanSchema` with `actions[]` + LLM-declared `destructive` + `requiresContext` (replaces regex heuristics), `z.preprocess(null → undefined)` on `PlanActionSchema.value` + `PlanSchema.missingContext` (Sonnet emits `null` for absent scalars). Prompt tightened with division-of-labor (LLM/runtime/reviewer) + target-app URL context. Dead code (`countNumberedSteps`, destructive regex) pruned. Test count 110 → **115**. |
+| **Week 1B — Commit 7b.iii.a: Block 1 iteration controller** | ✅ **Approved** | `src/mastra/lib/blockController.ts` — plain-TS orchestrator (NOT a Mastra sub-workflow) wrapping classify → retrieve → plan → dry_run in a pass loop. `BLOCK1_MAX_PASSES = 3`. Exit signal: `!plan.requiresContext && plan.actions.length > 0 && dryRun.domMatches`. On failure the controller records a reason (`plan_requires_context` / `plan_empty_actions` / `dry_run_mismatch` / `max_iterations`) + accumulated observations and re-runs the pass. New envelope variants `block.iteration.started` / `block.iteration.completed` with observation summary. `BlockResultSchema` attached to `DryRunSchema.blockResult` when the controller exhausts — reviewer UI renders an "exhausted" banner + disables the approve button on that path. Extracted step bodies (`runClassifyStep` / `runRetrieveStep` / `runPlanStep` / `runDryRunStep`) so the controller can invoke them directly while preserving their original `stepId` frame emissions (DESIGN INVARIANT #1). Test count 115 → **130**. |
+| **Week 1B — Commit 7b.iii.b-bus-extension** | ✅ **Approved** | `EventBus` per-stepId decision slots. New API: `publishClientDecisionForStep(runId, stepId, decision)` + `awaitDecisionForStep(runId, stepId)`. Old `publishClientDecision` / `awaitDecision` preserved as back-compat shims defaulting `stepId = "review_gate"`. Slot-consumption state machine with pre-delivery (slotsResolved === 0) + stale-discard (slotsResolved > 0, lingering commit) + per-slot idempotency scope. `GateStepIdSchema = z.enum(["review_gate", "human_verify_gate"])` narrows `clientFrameSchema.review.decide.stepId` at the wire; same enum on `src/http/runs.ts reviewBodySchema`. One-line production migration: `runReviewGateStep` uses `awaitDecisionForStep(runId, "review_gate")`. Test count 135 → **141** (+6 scoped + 1 cross-slot idempotency guard that caught an early draft regression). |
+| **Week 1B — Commit 7b.iii.b-pre-exec-refine** | ✅ **Approved** | `runReviewGateStep` gains a refine while-loop. On `decision === "edit"` with `patch.notes`: synthesize a `Pre-exec refine N: reviewer note: <note>` observation, emit `block.backtrack.triggered { fromStep: "review_gate", backtrackCount: N, carriedContext: [...] }`, re-run Block 1 with the note threaded through, re-emit `review.requested`, re-await. Cap `MAX_PRE_GATE_REFINES = 2` (3 total slots; 3rd edit trips cap and terminates as reject). Helpers extracted: `buildBlock1Deps()` (no-arg factory), `block1ResultToDryRun` (shared happy/exhausted converter), `buildPreGateRefineContext` with slice-at-400 envelope-cap guard. Agent-side only; UI edit button deferred to 7b.iii.b-pre-exec-edit-ui. Test count 141 → **146** (+5). |
+| **Week 1B — Commit 7b.iii.b-2-hotfix-1: dry_run scope fix (Bug A Scope 1)** | ✅ **Approved** | Retroactive audit on `events` table uncovered `tool.failed { name: "playwright.session_check", error: "no browser session on RunContext" }` on 3 historical runs (`95e73245`, `e5b9b7b9`, `90632b7c` — 2026-04-23 22:18/23:21/23:47 UTC). Root cause since 7b.iii.a: `blockController.ts:runBlock1` wrapped `runDryRunStep` inside `withRunContext({ ...ctx, priorObservations }, fn)`. `runDryRunStep` mutates `ctx.browser = session`; the mutation lands on the spread copy and is lost when the scope unwinds. `executeStep` read `outer_ctx.browser === undefined`, emitted the session_check failure, silently produced `stepsRun=0`. Prior smoke reports relied on wire status + a coincidental Sonnet verify `/verified/i` false-positive — DB cross-check never happened and Jane was NOT actually being reset. Fix: split the pass loop so classify/retrieve/plan stay inside the cognitive spread (they only read), dry_run runs in the OUTER ctx. Regression test `blockController.test.ts [8]` guards scope identity (`expect(getRunContext()).toBe(outerCtx)` inside the stub) + propagation symptom. Test count 146 → **147** → **148** on merge. |
+| **Week 1B — Commit 7b.iii.b-pre-exec-edit-ui: UI Edit path** | ✅ **Approved** | `services/test-webapp/app/agent/review/[runId]/page.tsx` ReviewPanel gains three-mode state (`default` / `edit` / `submitting`). Default: Edit / Reject / Approve buttons. Edit: textarea (2000-char cap matching `PlanPatchSchema.notes`), Submit disabled-until-non-empty, Cancel returns to default. Submitting: accent-border, disabled "Waiting for refined plan…" + local "Cancel refine (unlock panel)" escape hatch (UI-only reset, does NOT cancel server-side refine; documented in docblock). `planId`-delta `useEffect` auto-exits submitting when the fresh `review.requested` arrives. `decide()` callback widened to send `decision: "edit"` + `patch.notes` + `stepId` (from `pendingReview.stepId`). `ReviewRequestedFrame` type alias narrows the discriminated frame. globals.css: `.review-panel.edit-mode`, `.review-panel.submitting`, `.btn.edit` + `.review-edit-*` styles. Agent tests 148 unchanged (UI-smoke-gated per commit-4 / 6b / 7a precedent). |
+| **Week 1B — Commit 7b.iii.b-pre-exec-edit-ui-hotfix-1: pendingReview memo + browser pre-close (Bug 1 + Bug B)** | ✅ **Approved** | Two-file bug fix. **Bug 1 (memo):** post-edit-UI apply, ReviewPanel unmounted on `review.decided{edit}` because the memo `decisions.length >= reqs.length` treated edit as gate-closing. Fix: keep panel mounted if last decision is `edit` AND no run-terminal yet; close when last non-edit decision matches reqs. **Bug B (browser-lock collision):** Playwright MCP locks `.playwright-videos/<runId>/.mcp-profile` per run; second `launchBrowser` without explicit close fails with "Browser is already in use". Retroactive audit: 4 runs carried this error. Fix: `runDryRunStep` pre-closes `ctx.browser` before `launchBrowser`, silent catch on close() (prior transport may have died but lock releases). Self-healing across (a) commit-2 refine loop AND (b) 7b.iii.a intra-Block-1 multi-pass. Bug A had hidden Bug B (session never propagated → collision never tripped). |
+| **Week 1B — Commit 7b.iii.b-pre-exec-edit-ui-hotfix-1-amend-1: terminal guard narrowing** | ✅ **Approved** | Post-hotfix-1 smoke: synthetic `run.failed` frames from bus envelope-violation handler (Bug 3A on long-thinking plan step.completed) closed ReviewPanel permanently via the new run-terminal short-circuit. Fix: narrow `isRunTerminal` from `run.completed || run.failed` to `run.completed` only. `run.failed` fires from TWO sources (bus envelope violations — workflow keeps running; workflow exception catches — always followed by `run.completed{status:"failed"}` in the post-finally block). `run.completed` is the authoritative single terminator on every exit path. 2-LoC functional change; Bug 3A flagged for separate hotfix. |
+| **Week 1B — Commit 7b.iii.b-pre-exec-edit-ui-hotfix-2: `seedObservations` + Bug A Scope 2+3 fix** | ✅ **Approved** | Bug 4 (`cannot invoke playwright.browser_snapshot: session already closed`) surfaced on refine-approve runs post-hotfix-1. NOT an abort-signal timing issue (launchBrowser's onAbort only fires on real external abort). Root cause: Bug A recurrence at a SECOND scope boundary — `runReviewGateStep`'s refine loop wrapped `runBlock1Impl` in an outer `withRunContext({ ...ctx, priorObservations: carriedContext }, fn)`. Inside, `runDryRunStep`'s `getRunContext().browser = session` mutation landed on the spread copy. Additionally, the inner cognitive spread in `runBlock1` overrode `ctx.priorObservations` with `[]` on pass 0, so the reviewer's note NEVER reached any LLM (dormant bug). Fix folded both: add `opts.seedObservations` to `runBlock1`, seed internal `observations = [...opts.seedObservations ?? []]` on entry. Remove outer `withRunContext` spread at the refine call site + the in-comment equivalent in the parked `humanVerifyGateStep` (Bug A Scope 3, pre-emptively fixed so commit 4's un-park is pure comment-stripping). `runBlock1` docstring codifies "DO NOT wrap in a withRunContext spread to pass observations." Test file `reviewGateRefine.test.ts` stub-signature updated to capture `opts.seedObservations` instead of `getRunContext().priorObservations`; 148 stays locked. |
+| **Week 1B — Commit 7b.iii.b-human-verify-gate** | ✅ **Approved (4-run live smoke clean)** | `humanVerifyGateStep` un-parked (pure comment-stripping — hotfix-2 Diff 3 had pre-corrected the parked body). `MAX_BACKTRACKS = 2` (3 total slots; 3rd reject forces `success: false` + evidence marker). New `buildBacktrackContext` helper, envelope shape matches `humanVerifyGate.test.ts [2]` verbatim: `[header "Backtrack N: ..."] [reviewer note?] [stepsRun] [success] [evidence?]`. `.then(humanVerifyGateStep)` inserted in workflow chain between verify and log_and_notify. **Piece B — LEFT-column re-emission:** synthetic `block1 step.started` + `step.completed` frames around every refine's `runBlock1Impl` AND every backtrack's `runBlock1` call; `StepOutcome` uses `findLast` to read the latest. LEFT column now reflects the currently-pending plan. **Piece C — ReviewPanel post-exec variant:** `reviewHint === "post_exec"` branches to "Post-execution review" copy, Reject+Approve only (Edit deliberately hidden — wedge-prevention rationale documented in-panel because humanVerifyGateStep treats edit as happy-path equivalent to approve). **Piece D — FeedBacktrackBanner:** full-width feed banner on `block.backtrack.triggered` frames; copy branches on `fromStep` (pre-exec `review_gate` vs. post-exec `human_verify_gate`); reviewer note surfaced as first-class field. **Piece A.5 — Bug 3A mitigation:** `thinking: ""` dropped from both `runPlanStep` return sites (UI reads from `llm.thinking.delta` stream, never from step.completed path — verified). Test count 148 → **150** (+2: buildBacktrackContext pure-function shape in `humanVerifyGate.test.ts [4]`; LEFT-column re-emission pair guard in `reviewGateRefine.test.ts [6]`). 4 live runs: A/B/C/D covered approve-only, post-exec reject→backtrack, pre-exec edit refine, post-exec budget exhaust. Jane DB resets verified on all approve paths. Zero regressions across all 4 forensic fingerprints. |
+| **Week 1B — Commit 7b.iii.b-docs-sync** | ✅ **In progress (this commit)** | `runContext.ts` — CTX SPREAD INVARIANT docblock + stale `priorObservations` comment updated to reflect hotfix-2's seedObservations pathway. `ARCHITECTURE.md §2.1` — 9-step workflow + 2 gates; §2.7 — post-exec ReviewPanel variant, FeedBacktrackBanner, three-mode state with escape hatch, LEFT-column `findLast` + synthetic block1 re-emission. `STARTUP_PROCESS.md §1.6` — Edit-click + post-exec smoke paths. `MASTER_PLAN.md` — this progress table expansion + Week-2 polish queue (below). No code changes, no test changes. |
+| **Week 1B exit criterion (current)** | — | `POST /triage` with a password-reset ticket produces an end-to-end **agentic-feeling** reviewer experience. Visibly streaming ReAct iterations on `retrieve` (thought → RAG call → observation → next thought), every browser action during `execute` emits a screenshot that refreshes the behavior feed at ~1 Hz, thinking blocks fade to one-line summaries on completion with click-to-expand, typewriter reveals output text char-by-char, Jane's password actually resets, and transient Anthropic 500s no longer kill the run. Live VNC browser feed is **deliberately deferred** to a post-Week-5 stretch ("Commit 10c") — the behavior feed delivers ~95 % of the "watch the agent work" product value at ~5 % the infrastructure cost. `browser-viewer` service stays compose-wired but idle so reactivation is cheap if we ever need it. |
+| Week 2 — Skill cards + RAG wiring | — | Zod skill-card schema, runbook ingest, apply `createReActStep` to `classify` (think → category-hint RAG → confirm) and `verify` (think → snapshot read-back → confirm). The `?collection=` upstream patch is **no longer needed** — UUID-filename convention handles routing. |
+| Week 3 — Full workflow hardening + review-gate UX | — | Inline plan editing on the review gate (approve-with-edits emits a `plan_patch` on the existing `review.decided` frame). ReAct budget per step instrumented. Skill-card-gated `destructive` replaces the regex inference. Full replay tests. |
+| Week 4 — Evals + replay + observability | — | Deterministic/LLM-judge/regression layers, session replay, `/metrics` |
+| Week 5 — Demo polish | — | Three scenarios, pitch deck, README for design partners |
+| Week 6+ — Design-partner pilot | — | Unchanged from original plan |
+| **Commit 10c (post-Week-5 stretch) — Live VNC browser feed** | 🔵 Parked | Xvfb + x11vnc startup in agent container + noVNC iframe in reviewer UI. **Deliberately deferred** after Week 1B rethink: the screenshot-on-action rail delivers ~95% of the "watch the agent work" product value at ~5% the infrastructure cost. VNC graduates from nice-to-have to must-have only when we hit a real diagnostic case a screenshot rail can't answer (e.g., debugging a mid-transition DOM race a customer reports). `browser-viewer` service stays in compose idle so the activation is still one start-order file away. |
+
+### 7b.iii.b series — forensic audit + causal narrative
+
+Four distinct failure fingerprints surfaced across the 7b.iii.b series. Each is SQL-identifiable on the `events` table and each has a documented causal relationship with the others. This table is the audit trail — retention and replay rely on it.
+
+| Bug | SQL fingerprint | Affected runs pre-fix | Post-fix | First masked by |
+|---|---|---|---|---|
+| **A** — spread-mutation loss on `ctx.browser` (three scope boundaries) | `type='tool.failed' AND payload->>'name'='playwright.session_check' AND payload->'error'->>'message' LIKE '%no browser session%'` | **3** (`95e73245` / `e5b9b7b9` / `90632b7c`, all 2026-04-23) | **0** | — (original bug) |
+| **B** — Playwright MCP profile lock collision on re-launch | `type='tool.failed' AND payload->'error'->>'message' LIKE '%Browser is already in use%'` | **4** (overlapping A) | **0** | Bug A (session never propagated → re-launch never attempted) |
+| **4** — session closed between refine's dry_run and executeStep | `type='tool.failed' AND payload->'error'->>'message' LIKE '%session already closed%'` | **2** (hotfix-1 era runs, post-Bug-B fix) | **0** | Bug B (pre-fix, refine's `launchBrowser` failed before the close path could be exercised) |
+| **3A** — envelope violation on oversize `step.completed.output` | `type='run.failed' AND payload->'error'->>'message' = 'envelope_violation'` | **1** (stochastic, long-thinking plan run) | **0** | Orthogonal to A / B / 4; unmasked (not caused) by hotfix-1's terminal-guard closing the UI; mitigated in commit 4 by dropping `thinking` from `runPlanStep`'s step.completed output |
+
+**Causal narrative (roll into commit-5 docs and any future onboarding):**
+
+> Bug A hid Bug B hid Bug 4. All three were **the same root cause at three different scope boundaries** — `runDryRunStep`'s mutation of `ctx.browser = session` landing on a spread copy inside `withRunContext({ ...ctx, <override> }, fn)` instead of propagating to the outer RunContext that `executeStep` reads. Scope 1 (blockController inner cognitive spread around dry_run) was fixed in `7b.iii.b-2-hotfix-1`. Scope 2 (runReviewGateStep outer refine-loop spread around `runBlock1Impl`) was fixed in `7b.iii.b-pre-exec-edit-ui-hotfix-2`. Scope 3 (parked humanVerifyGateStep outer backtrack-loop spread) was fixed in-comment by the same hotfix so commit 4's un-park was pure comment-stripping. Bug 3A is orthogonal (a separate envelope-size issue) but was coincidentally exposed by the terminal-guard introduced in `7b.iii.b-pre-exec-edit-ui-hotfix-1` and resolved by dropping the unused `thinking` payload in commit 4's Piece A.5. The **CTX SPREAD INVARIANT** docblock in `services/agent/src/mastra/runContext.ts` codifies the "which RunContext fields are safe to spread" rule and provides a grep recipe (`rg 'withRunContext\(\{\s*\.\.\.' services/agent`) so future contributors don't re-derive Bug A's class at a fourth scope boundary.
+
+**Meta-observation for future smoke discipline:** Gate 1 of the hotfix-2 smoke cycle was briefly false-positived on wire-level "status=ok" until a retroactive database cross-check proved Jane's row was NOT actually mutating on runs the agent was reporting as successful. Sonnet's `verifyStep` prompt (`triage.ts:1396-1399`) is terse enough to hallucinate `/verified/i` against `stepsRun=0` input. **DB cross-check is mandatory acceptance for any run that touches executeStep** — the wire cannot be trusted as single source of truth for external-system mutations. Week-2 polish item: tighten `verifyStep` to hard-fail on `stepsRun === 0 && !skipped` before the LLM call.
+
+### Week-2 polish queue (from the 7b.iii.b series)
+
+Non-blocking items surfaced during the series but deliberately deferred. Track here so they don't get lost between handoffs.
+
+| # | Item | Surface | Scope |
+|---|---|---|---|
+| 1 | `rag.ts` → `CircuitBreaker` refactor | `src/mastra/tools/rag.ts` | rag.ts has its own `p-retry` today; unify on 7b.i primitive when convenient |
+| 2 | `verifyStep` prompt hard-fail on `stepsRun === 0 && !skipped` | `triage.ts runVerifyStep` | hide Sonnet `/verified/i` false-positive; enforce DB-reality before LLM call |
+| 3 | `planStep` `tryParseJson` last-fence-not-first fix | `triage.ts tryParseJson` | Sonnet emits analysis-prose + multi-fence on long-thinking plans; current regex grabs first block and falls over; robust fix reads LAST `{...}` or LAST ```json fence |
+| 4 | `--warn-rgb` token + normalize hardcoded `rgba(242,182,65,...)` sites | `globals.css` | no `--warn-rgb` today; existing call sites hardcode rgba; consistency cleanup |
+| 5 | `MaxListenersExceededWarning: 33 abort listeners` cleanup | `playwrightMcp.ts` | each `launchBrowser` + each `callTool` registers an abort listener; multi-pass runs accumulate; raise or per-session-unregister |
+| 6 | Feed-noise audit on synthetic `block1` step.started/completed emissions | `page.tsx BehaviorFeed` | 4-run live smoke judged readable, but density could feel noisy with longer refine chains; option to conditionally suppress synthetic block1 FeedDividers |
+| 7 | Env-var override for `MAX_BACKTRACKS` / `MAX_PRE_GATE_REFINES` / `BLOCK1_MAX_PASSES` | `triage.ts` / `blockController.ts` | one-line consts today; operator tuning without redeploy |
+| 8 | Per-pass `stepsRun` rolling-window indicator | `page.tsx StepOutcome` | currently execute's stepsRun is scalar latest; richer signal on multi-backtrack runs |
+| 9 | "Override-and-proceed" on exhausted `blockResult` | `ReviewPanel` exhausted branch | today: Reject only; allow reviewer to manually approve despite `passedLast: false` |
+| 10 | `reviews` Postgres PK migration `(runId)` → `(runId, stepId)` | `src/db/schema.ts` | today the 2nd gate decision's DB write is `onConflictDoNothing` silently dropped; events table carries the authoritative audit but the `reviews` row is single-slot |
+| 11 | Post-exec "approve with audit note" semantic | `humanVerifyGateStep` + ReviewPanel | currently Edit hidden on post-exec because the gate treats edit ≡ approve; a distinct "approve + note" path would un-hide Edit |
+
+---
+
+## 1. Guiding Decisions (locked in)
+
+| Area | Decision | Why |
+|---|---|---|
+| Agent framework | **Mastra** (TS), inside this dev container | Matches provided plan; first-class MCP client support |
+| Browser control | **Playwright MCP server** (`@playwright/mcp`), invoked as an MCP tool from Mastra | DOM-based, 10× faster/cheaper than vision; fallback to Claude Computer Use later if needed |
+| RAG | **Reuse `docs_pipeline_311` over HTTP** (`POST /docs/models/qa`, `POST /docs/models/semantic`) | Single embedding stack, single vector DB, already working |
+| Vector store | **Qdrant** (already used by RAG). Collections: `runbooks`, `skill_cards`, `selector_memory` | No second vector DB; one truth |
+| Structured state | **Postgres** (event log, review queue, selector memory rows, skill-card metadata) | Relational joins + retention; SQLite only acceptable for week-1 spike |
+| Headful browser viewing | **Screenshot-on-action rail** for Week 1B (reuses the existing `browser.screenshot` envelope frames + the 6c `/static` route; implicit screenshots after every Playwright action push the update rate to ~0.5–1 fps). Live VNC feed (`browser-viewer` noVNC sidecar) stays compose-wired but idle; graduates from parked to active only when we hit a debugging case the screenshot rail can't answer. | Fewest moving parts for the same "watch the agent work" product story; no Xvfb / x11vnc / fluxbox supervision needed in the dev-container lifecycle; zero new processes; zero new protocols. |
+| Container topology | **Docker Compose**; the dev container we already created becomes the `agent` service | Matches current workflow; clean isolation per service |
+| Review gate | Mastra workflow `suspend() / resume()` + a review API surface + optional Mastra Studio UI | Built-in to the framework |
+| Secrets | Injected as env vars or mounted secrets; agent never sees plaintext in LLM context | Security is a pitch feature |
+
+---
+
+## 2. System Topology (Compose view)
+
+```
+┌─────────────────────────────── docker-compose ───────────────────────────────┐
+│                                                                              │
+│  agent (this repo, dev container)                                            │
+│    ├─ Mastra workflows + tools (TS, Node 20)                                 │
+│    ├─ Playwright MCP server (headed Chromium + Xvfb + x11vnc on :5900)       │
+│    ├─ HTTP API: POST /triage, WS /stream, GET /review/:id                    │
+│    └─ env: RAG_URL=http://rag:3009  QDRANT_URL=http://qdrant:6333            │
+│           PG_URL=postgres://...   LLM_API_KEY=...                            │
+│                                                                              │
+│  rag  (docs_pipeline_311, unchanged)                                         │
+│    └─ FastAPI on :3009  (upload, qa, semantic, monitor)                      │
+│                                                                              │
+│  qdrant                                                                      │
+│    └─ :6333 (HTTP), :6334 (gRPC)                                             │
+│       collection model: ONE per ingested document (or shared-UUID group),    │
+│                         UUID-named; created on first write, appended on      │
+│                         re-upload. See §3 and ARCHITECTURE §2.2 / §2.3.      │
+│                                                                              │
+│  postgres                                                                    │
+│    └─ :5432  schemas: events, reviews, skills, selectors                     │
+│                                                                              │
+│  browser-viewer  (socat + noVNC, pattern from agent_sidecar_311)             │
+│    └─ :6080 noVNC → :5900 (agent's x11vnc)                                   │
+│                                                                              │
+│  test-webapp  (Next.js stub — built in Week 1)                               │
+│    └─ :3000  login / user list / reset password / system status              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The dev container continues to mount the workspace at `/workspace`. Compose elevates it from a single-container to a service-graph setup when Phase 1 begins.
+
+---
+
+## 3. Knowledge Base — Concrete Bindings
+
+The plan calls for three KB pieces. Here is exactly how they map onto existing infrastructure.
+
+### 3.1 Runbook corpus → existing RAG pipeline (no changes needed)
+
+- Author runbooks as HTML/PDF/DOCX in `kb/runbooks/` in this repo.
+- CI (or a dev script) POSTs them to `rag:3009/docs/upload/documents`, naming them `runbook_<SHARED_RUNBOOKS_UUID>.html` so they all land in the same `<SHARED_RUNBOOKS_UUID>` Qdrant collection (append semantics).
+- The pipeline cleans, chunks (300 tokens, overlap 10 per `config.yml`), embeds with e5-large-v2, and upserts with UUID point IDs.
+- Agent retrieval: `POST rag:3009/docs/models/qa` with `{ query, collection_name: "<SHARED_RUNBOOKS_UUID>" }`.
+- The `SHARED_RUNBOOKS_UUID` is generated once per deployment and stored in `.env` (or Postgres as a convention). Every runbook upload carries it; every query uses it. Appending new runbooks never clobbers existing ones.
+
+### 3.2 Skill cards → YAML on disk + embedded prose in Qdrant
+
+- YAML files in `kb/skill_cards/<app>/<skill>.yml` (authoritative source, versioned with code).
+- Schema in `src/schemas/skill-card.ts` (Zod). Fields: `app`, `base_url`, `auth`, `skills[].{ name, preconditions, steps, postconditions, rollback, destructive }`.
+- A thin embedding bridge (`scripts/embed-skill-cards.ts`) extracts the human-readable prose and uploads each skill card's .html/.txt to `rag:3009/docs/upload/documents` naming the file `skill_<SHARED_SKILLS_UUID>.html`. All skill cards live in a single collection (the one named by `SHARED_SKILLS_UUID`), and re-running the script appends without clobbering.
+- **The `?collection=` upstream controller shim originally planned here is no longer needed** — the UUID-in-filename convention landed during Phase 0.5 solves routing without any upstream Python changes.
+- At plan time, Mastra retrieves candidate skill cards by semantic search against `SHARED_SKILLS_UUID`, then loads the full YAML from disk for execution.
+
+### 3.3 Selector memory → Postgres + semantic fallback
+
+- Primary: Postgres table `selectors (app, skill, semantic_element, current_selector, last_verified_at, confirmations_count)` — fast lookup, transactional updates.
+- Fallback: when a selector breaks, agent captures the DOM, embeds a description of the target element, queries Qdrant collection `<SHARED_SELECTORS_UUID>` for the nearest historical match, proposes a new selector, and writes back to Postgres after verification. Collection created on first write via the same filename convention used for runbooks + skill cards.
+
+---
+
+## 4. Mastra Workflow (concrete step IO)
+
+Workflow: `triage-and-execute`. Each step has typed input/output (Zod) and is independently resumable.
+
+| # | Step | Model | Inputs | Outputs | Side effects |
+|---|---|---|---|---|---|
+| 1 | `classify` | Haiku | raw ticket | `{ category, urgency, target_apps[], confidence }` | event log row |
+| 2 | `retrieve` | — | classification | `{ runbook_chunks[], skill_cards[] }` | 2 HTTP calls to `rag:3009` |
+| 3 | `plan` | Sonnet | 1+2 | ordered `Action[]` citing skill-card step IDs | event log row |
+| 4 | `dry_run` | — | plan + skill cards | `{ dom_matches: bool, anomalies[] }` | Playwright navigates + reads DOM; no state change |
+| 5 | `review_gate` | — | plan + screenshots + dry-run result | **suspends** until human decision | review row in Postgres; WS push |
+| 6 | `execute` | — | approved plan | per-step screenshots, final DOM state | Playwright MCP tool calls; video saved |
+| 7 | `verify` | Sonnet | postconditions + final state | `{ success: bool, evidence[] }` | event log row |
+| 8 | `log_and_notify` | — | everything above | trace URL | ticket update, event log closed, video archived |
+
+**Destructive actions** (marked in the skill card) force `review_gate` to block; cannot be bypassed, even in autonomous mode.
+
+### 4.1 Reactive (ReAct) substeps inside the pre-gate cognitive steps
+
+The top-level workflow is plan-and-execute (NOT a single monolithic ReAct loop), because the gates are the product's soul — "we are the gatekeepers, the agent is the path-proposer." Inside each pre-gate cognitive step (`classify`, `retrieve`, `plan`, `verify`), the reasoning itself is promoted from one-shot LLM calls into short ReAct loops using a reusable `createReActStep` runner.
+
+**The runner (Commit 7b):** one Mastra-step factory that takes a goal, a tool registry (subset of `{rag.retrieveRunbooks, rag.retrieveSkills, playwright.snapshotReadOnly, ...}`), a `maxIterations` budget, and returns a step whose body is:
+
+```
+for iteration in 0..maxIterations:
+  emit react.iteration.started { stepId, iteration }
+  thought = streamMessage(thinkingEnabled=true)      // reuses existing streamMapper
+  action  = parseAction(thought.text)
+  if action.kind === "final":
+    emit react.iteration.completed { final: true, answer }
+    return answer
+  observation = await dispatchTool(action)           // reuses rag.ts / playwrightMcp.ts wrappers
+  emit react.iteration.completed { observationSummary }
+  // next iteration's messages array includes the observation
+throw "ran out of iterations"
+```
+
+**The wire contract** is additive: we introduce two envelope variants, `react.iteration.started` and `react.iteration.completed`, each carrying `{ stepId, iteration, reactRunId }`. Every existing `llm.*` and `tool.*` frame emitted *inside* a ReAct iteration carries an optional `reactIterationId` so the reviewer UI can nest them as sub-rows under the step card. No new WS endpoint, no new bus mechanic — the existing ring buffer + seq monotonicity carry through unchanged.
+
+**First applications of the runner** (Commits 7b → Week 2):
+
+| Step | Current (one-shot) | ReAct variant |
+|---|---|---|
+| `classify` | single Haiku call with the raw ticket | think → (optional) RAG query against a small category hints corpus → confirm category + urgency |
+| `retrieve` | two RAG calls with identical `category (apps)` query strings | think → targeted RAG for runbooks → observe hit scores → if weak, refine query and retry → also pull skill cards |
+| `plan` | single Sonnet call with extended thinking | think → can call `rag.retrieveSkills` mid-plan if it realizes a skill hint is missing → propose ordered action list |
+| `verify` | single Sonnet call with the post-state string | think → read post-action snapshot → compare against preconditions → confirm success OR flag anomaly |
+
+`dry_run` and `execute` stay plan-and-execute-shaped (sequential deterministic tool calls, not reasoning loops) — the action sequence there is already decided by `plan`. `review_gate` is the human, and `log_and_notify` is a side effect. Turning those into ReAct loops would add failure surface without moving the product story.
+
+**Why this split preserves the product pitch.** The gates are still human-blocking and still the authoritative "approve the path" step. ReAct runs *before* each gate to produce the richest possible proposal; the human approves or rejects the whole proposal, not individual ReAct iterations. Auditability improves because every thought, every tool call, and every observation between gates is in the event log.
+
+---
+
+## 5. API Surface (what the agent container exposes)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/triage` | Body: ticket. Starts a workflow run, returns `run_id` |
+| `GET` | `/runs/:id` | Current state of a run (including pending review gates) |
+| `POST` | `/runs/:id/review` | Body: `{ decision: approve\|reject\|edit, plan_patch? }` |
+| `WS` | `/stream/:id` | Streams thoughts, tool calls, screenshots, video frames |
+| `GET` | `/review/pending` | All paused runs waiting on a human |
+| `GET` | `/healthz` | Liveness (also verifies rag + qdrant reachable) |
+| `GET` | `/metrics` | Prometheus-format |
+
+The reviewer UI is the Next.js `/agent/review/[runId]` page shipped in Week 1A Commit 3 and progressively enhanced through Commits 6c (inline `<img>` thumbnails) + 7a (screenshot-on-action rail + Cursor-style thinking fade/collapse + typewriter `llm.text` + tool-call cards) + 7b (`react.iteration.*` nested rows inside each step card). Mastra Studio is reserved for workflow authoring, not review.
+
+> **Parked stretch.** `browser-viewer` (socat + noVNC at `:6080`) stays compose-wired but idle. Its iframe embed into the reviewer page is a "Commit 10c" stretch that activates only if screenshot-on-action proves insufficient for a real diagnostic case.
+
+---
+
+## 6. Security Posture (non-negotiable from day one)
+
+- Agent container runs Chromium as a **non-root** user (`agent`).
+- Playwright pinned to a **single origin per run** (derived from the skill card's `base_url`); navigation outside the allowlist is a hard failure.
+- Credentials mounted at `/run/secrets/*`, surfaced to Playwright via env, **never** included in LLM prompts.
+- Compose network: `agent` can reach `rag`, `qdrant`, `postgres`, `test-webapp`, and the LLM API. No other egress.
+- Video recording: Playwright's built-in `recordVideo` on every run, stored to a volume, retention configurable.
+- Rate limits on destructive actions at the agent layer (per-skill quotas enforced before the review gate, so the UI shows the quota remaining).
+
+---
+
+## 7. Phased Execution Roadmap
+
+Your original (c) → (a) → (b) ordering is right. Concrete weekly plan:
+
+### Week 1 — Test webapp + loop proof (you picked this as step 1)
+**Goal:** hard-coded skill executes end-to-end against a realistic target.
+
+- `services/test-webapp/` — Next.js app: `/login`, `/users` (search + list), `/users/:id/reset-password` (with confirm dialog + success toast), `/status`. Seeded users.
+- `docker-compose.yml` with: `agent`, `test-webapp`, `postgres`, `qdrant`. (`rag` added in Week 2.)
+- Dev container → Compose: promote `.devcontainer/devcontainer.json` to `dockerComposeFile` mode with service `agent`.
+- In `agent`: install Playwright MCP + Mastra; write one hardcoded Mastra workflow that performs `reset_user_password` for `jane@example.com` against `test-webapp`. No RAG yet. No review gate yet.
+- **Exit criteria:** `POST /triage` with a fixed ticket body resets Jane's password, captures per-step screenshots, writes an event log row.
+
+### Week 2 — Skill cards + RAG wiring
+**Goal:** the agent reads skill cards from disk and retrieves runbooks over HTTP.
+
+- `src/schemas/skill-card.ts` — Zod schema; `scripts/validate-skill-cards.ts`.
+- Author 5–8 skill cards for the test-webapp (`reset_user_password`, `lookup_user`, `check_system_status`, `unlock_account`, `update_ticket_note`).
+- `scripts/embed-skill-cards.ts` — uploads prose, naming each file with the configured `SHARED_SKILLS_UUID` so they all land in one append-mode collection.
+- `kb/runbooks/` — 10 HTML runbooks; ingestion script uploads them with `SHARED_RUNBOOKS_UUID` in the filename (one collection, appended).
+- Mastra tools: `rag.retrieveRunbooks(query)`, `rag.retrieveSkills(query)`, `skills.load(id)`.
+- Refactor Week-1 workflow to retrieve skills by semantic search instead of hardcoding.
+- **No upstream `rag` changes required** — Phase 0.5 already landed the filename-UUID convention that handles per-collection routing.
+- **Exit criteria:** agent handles `reset_user_password` AND `unlock_account` with zero code changes between them — skill card lookup alone.
+
+### Week 3 — Workflow hardening + review-gate UX (all 8 steps are already real as of Week 1B)
+
+**Goal:** sharpen the gate experience itself now that the underlying agentic flow is shipped.
+
+- **Inline plan editing at `review_gate`.** Reviewer can tweak the proposed plan before approving; the edits ride the existing `review.decided` frame's optional `plan_patch` field, already in the envelope schema. `executeStep` reads the patch and substitutes actions before dispatching to Playwright MCP.
+- **Skill-card-declared `destructive` property** replaces the regex inference currently done in `planStep`. Skill cards are loaded from disk at plan time; their `destructive: true` field authoritatively decides whether `review_gate` blocks.
+- **ReAct budget instrumentation.** Per-step iteration counts, tool-call counts, wall-clock, and token cost all land as fields on `react.iteration.completed` so the reviewer sees "this retrieve took 3 iterations, 2 RAG calls, 400 ms, $0.002."
+- **Replay tests** exercise the whole pipeline from a captured ticket fixture — no LLM calls, mocked tool responses — so regressions on the ReAct loop, the review gate, and the step chaining all surface in CI.
+
+**Exit criteria:** a destructive skill pauses at `review_gate`, reviewer edits the plan inline and approves, run completes under the edited plan with full audit trail.
+
+### Week 4 — Evals + replay + observability
+**Goal:** every run is re-runnable; regressions caught in CI.
+
+- Session replay: deterministic serialize/deserialize of `{ ticket, plan, dom_snapshots, tool_calls, final_state }` into `fixtures/<id>.json`.
+- Eval harness:
+  - **Layer 1 (deterministic):** plan covers required steps, postconditions verified in test-webapp DB, screenshots present.
+  - **Layer 2 (LLM judge, Opus):** plan quality, recovery behavior, review-gate wording.
+  - **Layer 3 (regression):** every fixture runs on PR; failing fixtures become new fixtures.
+- Cost/latency instrumentation per step; Prometheus `/metrics`.
+- **Exit criteria:** CI runs 20+ fixtures on every push; cost-per-ticket dashboard.
+
+### Week 5 — Demo polish
+- Three polished flows: password reset, access request, system status check.
+- Pitch deck driven by a recorded run: ticket → plan → review → execution → audit trail.
+- Public-facing README with architecture diagram and security narrative.
+
+### Week 6+ — Design-partner pilot
+Unchanged from your plan. The test-webapp is the demo asset during weeks 1–5; the pilot replaces it with the partner's staging env.
+
+---
+
+## 8. Near-Term Changes to This Repo
+
+### 8.1 Phase 0 — completed
+
+1. ✅ **Dev container promoted to Compose.** `.devcontainer/devcontainer.json` uses `dockerComposeFile: ["../docker-compose.yml"]`, `service: "agent"`.
+2. ✅ **Repo unified.** `docs_pipeline_311` and `agent_sidecar_311` copied into `services/rag/` and `services/browser-viewer/`.
+3. ✅ **Compose topology stood up.** `docker-compose.yml` declares `agent-net` (bridge, `172.28.0.0/16`) and six services.
+4. ✅ **Images built and run clean.** `rag` ~7 min first build (pip + spaCy model), `agent` ~5 min (Playwright + Chromium + Xvfb).
+5. ✅ **Healthcheck portability bugs caught:**
+   - `qdrant/qdrant:latest` ships no `curl`/`wget`/`nc` — only `bash`. Healthcheck uses bash `/dev/tcp` to `GET /readyz`.
+   - `python:3.11-slim` ships no `wget`. Healthcheck uses `python -c "import urllib.request..."`.
+
+### 8.2 Phase 0.5 — RAG foundation completed
+
+Full paper trail of every patch landed to get the RAG pipeline green end-to-end:
+
+1. ✅ **HF model patched and pushed.** `guymorganb/e5-large-v2-4096-lsg-patched`: `**kwargs` on four HF-facing `forward()` signatures (`LSGBertEmbeddings`, `LSGSelfAttention`, `LSGBertEncoder`, `LSGBertModel`); defensive default for `position_embedding_type` in `LSGBertEmbeddings.__init__`. Commit `dee44c0` on `origin/main`. Fixes the `cache_position` and `position_embedding_type` incompatibilities with transformers 4.40+.
+2. ✅ **Cross-volume file moves.** `services/rag/src/util/document_cleaning_pipline.py`: three `os.rename` calls replaced with `shutil.move` so the cleaner works when `dirty_documents/` and `clean_docs/` are on separate Docker named volumes.
+3. ✅ **Self-bootstrapping watch dirs.** `services/rag/src/util/queue.py`: `FileQueue.__init__` auto-creates `html/ pdf/ docx/ other/ temp/` instead of silently warning when they're missing.
+4. ✅ **UUID-in-filename collection routing.** `services/rag/src/util/queue.py`: new `tag_filename_with_uuid()` helper + regex. Files dropped without a UUID get one auto-appended before staging into `temp/`; files already carrying a UUID are preserved verbatim. The UUID persists through the cleaner's rename into `clean_docs/<ts>/`.
+5. ✅ **Collection-per-document.** `services/rag/src/model/embedding_model.py`: `_collection_from_sibling_files()` extracts the routing UUID from any sibling file in the processing dir; `embed_document()` uses it as the Qdrant collection name. UUID point IDs on every upsert so chunks never clobber each other.
+6. ✅ **Concurrency race fix.** `services/rag/src/vector_store/qdrant_config.py`: module-level `threading.Lock` around the `ensure_qdrant_collection` check-then-create; `409 Conflict` responses absorbed as success. Resolves silent upsert-loss when N workers race to create the same brand-new collection.
+7. ✅ **Dependency pins.** `services/rag/requirements.txt`: `transformers>=4.46,<5`, `torch>=2.6,<2.8`, `qdrant-client<1.13`, `huggingface-hub<1.0`, `tokenizers<0.22`. All four pins were forced by specific compat failures observed during bring-up.
+8. ✅ **Test fixtures in-repo.** `services/rag/test_fixtures/runbooks/{password-reset,unlock-account,system-status-check}.html` + `test_fixtures/README.md` with the drag-and-drop test recipe.
+9. ✅ **End-to-end smoke verified.** 6 concurrent drops (3 tagged with shared UUID, 3 untagged) produced exactly 4 collections in distribution `3 + 1 + 1 + 1`. No 409s. No lost upserts. Two cleaning + two embedding threads visibly interleaved.
+
+### 8.3 Still to do before Week 1 code
+
+1. **Streaming LLM thoughts into the agent loop.** User has reference code from a prior project to share; merge that pattern into the agent service design before Week 1 workflow work begins.
+2. **Scaffold the agent service code:** `services/agent/package.json`, Mastra install, `src/index.ts` (HTTP + WS server that surfaces the stream from #1), `src/workflows/`, `src/tools/`, `src/schemas/`, `kb/{runbooks,skill_cards}/`.
+
+---
+
+## 9. Open Questions (flag before Week 1)
+
+1. **Which LLM provider?** The plan assumes Claude (Haiku + Sonnet + Opus). If Anthropic API keys are in play, confirm; otherwise substitute and propagate to cost model.
+2. **Streaming LLM thoughts shape.** Waiting on the user's reference code (from a prior project) to decide: server-sent events vs WebSocket, chunk format, how intermediate reasoning tokens are exposed vs. tool calls vs. final output. This affects the Mastra workflow design and the agent's HTTP/WS API surface (§5).
+3. **Postgres vs SQLite for v1?** Default here is Postgres; trivially swappable if you want faster local iteration.
+4. **Review UI surface.** Mastra Studio is sufficient for Weeks 3–4. Custom Next.js review console is a Phase 5 decision.
+
+**Resolved during Phase 0.5:**
+
+- ~~Do we rebase `docs_pipeline_311` into this repo as a submodule~~ → **Copied in** per user direction; each service lives at `services/<name>/`.
+- ~~Per-collection routing needs a `?collection=` upstream shim~~ → **Replaced** by a filename-UUID convention that works without touching the upload controller.
+ 
+---
+
+## 10. What This Plan Does Not Change From Your Original
+
+- Three-layer eval harness (deterministic / LLM-judge / regression).
+- Skill cards as the product's soul and the authoring/exploration story.
+- Security-as-a-pitch-feature framing.
+- "Don't build an open-ended agent that figures out new apps."
+- Week-by-week timeline and design-partner pilot playbook.
+
+The only substantive change is infrastructural: we use what's already built (`docs_pipeline_311`, sidecar pattern, Qdrant) instead of introducing parallel stacks (LanceDB, a fresh embedding layer, a bespoke viewer).
