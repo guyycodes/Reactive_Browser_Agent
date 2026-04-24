@@ -128,7 +128,13 @@ export async function embedSkillCards(
 
       const form = new FormData();
       const blob = new Blob([html], { type: "text/html" });
-      form.append("files", blob, filename);
+      // Field name is singular "file" — matches the FastAPI handler
+      // signature at services/rag/controllers/upload_controller.py:
+      //   async def upload_file(..., file: UploadFile = File(...), ...)
+      // Plural "files" produces HTTP 422 (FastAPI reports the `file`
+      // field as required). Caught by week2b-foundation-hotfix-1 smoke
+      // against the live RAG endpoint.
+      form.append("file", blob, filename);
 
       const resp = await fetchImpl(`${ragUrl}/docs/upload/documents`, {
         method: "POST",

@@ -86,11 +86,28 @@ import type { BrowserSession } from "./tools/playwrightMcp.js";
 export interface RunContext {
   runId: string;
   bus: EventBus;
-  /** Optional Playwright MCP browser session for Week-1B workflow steps.
-   *  Populated by `dryRunStep` at entry (6b), consumed by `executeStep`
-   *  (also 6b), closed by the workflow wrapper's `finally` in
-   *  `http/triage.ts`. Not present during `classify` / `retrieve` / `plan` /
-   *  `review_gate` / `verify` / `log_and_notify`. */
+  /** Optional Playwright MCP browser session.
+   *
+   *  Lifecycle (Week-2b-runtime):
+   *  - `runDryRunStep` populates this field via `launchBrowser`, after
+   *    pre-closing any stale session (hotfix-1 pattern for intra-Block-1
+   *    retries + refine + backtrack re-invocations).
+   *  - `runExecuteStep` probes session liveness at entry via a snapshot
+   *    call. On success: REUSES the session and invokes the executor
+   *    with `resumeAtFirstDestructive: true`, skipping the
+   *    non-destructive prefix that dry_run already walked. On failure
+   *    (session dead, commonly from review_gate timeouts): pre-closes +
+   *    fresh `launchBrowser`, runs the full skill card.
+   *  - Closed by the workflow wrapper's `finally` in `http/triage.ts`.
+   *
+   *  The session-carry-over optimization is load-bearing for UX: the
+   *  happy path skips 3-5s of re-login per run, and read-only skills
+   *  (no destructive steps) become a correct no-op at execute. The
+   *  graceful-fallback path costs one cheap probe call (~200ms) when
+   *  the session IS alive and one extra launch when it isn't.
+   *
+   *  Not present during classify / retrieve / plan / review_gate /
+   *  verify / log_and_notify. */
   browser?: BrowserSession;
   /** Commit 7b.ii-hotfix — the ticket payload from `POST /triage`,
    *  populated at workflow kickoff in `http/triage.ts`. Available to

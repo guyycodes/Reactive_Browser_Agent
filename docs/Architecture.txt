@@ -866,6 +866,180 @@ PRIMITIVES LAYER
      `event: circuit_breaker.state_change` — future PagerDuty hook.
 
 
+9.7  ADD A NEW MCP SERVER (filesystem, shell, Slack, GitHub, DB, etc.)
+──────────────────────────────────────────────────────────────────────
+
+  §9.1 covers generic tools (in-process calls, HTTP clients). An MCP
+  server is a SUBPROCESS you spawn and talk to over stdio via
+  `@modelcontextprotocol/sdk`. The shape is different enough to warrant
+  its own recipe. The CANONICAL reference implementation is
+  `src/mastra/tools/playwrightMcp.ts` — copy its structure.
+
+  NOTE: use raw `@modelcontextprotocol/sdk` only. Do NOT introduce
+  `@mastra/mcp`; the agent's MCP integration is deterministic-callTool
+  semantics by design (see the briefing's §4.6 invariant).
+
+  Steps:
+
+  1. Create `src/mastra/tools/<name>Mcp.ts`. Copy the skeleton from
+     `playwrightMcp.ts`:
+       - `launchSession({ runId, bus, stepId, signal })` that spawns the
+         MCP server subprocess, creates an `StdioClientTransport`, and
+         returns a session object with typed `callTool()` methods.
+       - Four INJECTABLE hooks for unit testing without spawning real
+         subprocesses: `clientFactory`, `transportFactory`,
+         `killProcessTreeImpl`, `fsImpl`. Copy the shapes verbatim.
+       - `session.close()` tree-kills the subprocess via a BFS + SIGKILL
+         leaf-first walk (the `killProcessTree` helper in
+         playwrightMcp.ts). MCP servers routinely reparent helpers to
+         PPID=1 on SIGTERM; leaking them is the #1 foot-gun.
+
+  2. Frame emission — identical contract to §9.1:
+       - Wrap every `callTool()` in `tool.started` + `tool.completed` /
+         `tool.failed` with `invocationId` + `name` + `durationMs`.
+       - REUSE existing frame types where the semantic fits (`tool.*`,
+         `browser.*`, `rag.retrieved`). Do NOT invent new frame types
+         unless the MCP surfaces a genuinely new category — the reviewer
+         UI reads frame types and adding one is scope creep.
+       - If `callTool()` returns a large payload (diff, dataset page,
+         logs), persist to disk and emit a frame with a file path
+         reference. The `browser.screenshot` pattern at
+         `/workspace/.playwright-videos/<runId>/<seq>.png` is the
+         template. Keeps every frame under the 16 KiB envelope cap.
+
+  3. Session lifetime decision — two choices, each with invariant
+     implications:
+
+     (a) PER-CALL session (spawn → callTool → close inside one step):
+         Simplest. No RunContext changes. No CTX SPREAD INVARIANT
+         concerns. Use this when the MCP is fast to spawn (<500ms) and
+         doesn't need to carry state (auth, workspace root) between
+         steps.
+
+     (b) LONG-LIVED session across workflow steps (like `ctx.browser`):
+         Add a new field to `RunContext` in `src/mastra/runContext.ts`.
+         This field IS load-bearing under the CTX SPREAD INVARIANT:
+         any step that MUTATES `ctx.<yourField> = session` must run
+         OUTSIDE any `withRunContext({ ...ctx, ... })` spread. Mirror
+         `ctx.browser`'s treatment: dry_run mutates it in the OUTER
+         scope (see Block 1 Design Invariant #2 in §4), and every
+         downstream consumer reads from the outer scope. If your MCP
+         session needs a pre-close before re-launch (see Bug B in
+         7b.iii.b series), implement it at the mutation site, not the
+         read site.
+
+         SESSION-REUSE PATTERN (Week-2b-runtime — canonical reference:
+         `runExecuteStep` at `src/mastra/workflows/triage.ts`):
+
+         When a session-bearing tool (like Playwright MCP, but the
+         pattern applies to any stateful MCP — filesystem working-dir,
+         LSP client, authenticated API client, etc.) is populated by
+         an UPSTREAM step (dry_run) and consumed by a DOWNSTREAM step
+         (execute) with a HUMAN GATE between them, the downstream
+         consumer should:
+
+           1. Liveness-probe the existing session BEFORE launching a
+              fresh one. Cheap probe = the cheapest read-only call the
+              wrapper exposes (e.g. `session.snapshot()` for Playwright,
+              a `fs.stat` for a filesystem MCP, a `noop/ping` for an
+              API MCP). ~100-300ms cost; wrap in try/catch.
+
+           2. Tag the session with the CURRENT step's `stepId` BEFORE
+              probing so the probe's `tool.started` / `tool.completed`
+              frames attribute correctly (not to the stale upstream
+              stepId). On probe failure the retagged session is about
+              to be closed anyway; the mutation costs nothing.
+
+           3. Branch on the probe outcome:
+                - SUCCESS → reuse the session. If the downstream step
+                  has skill-card-driven dispatch, pass a "resume at
+                  first `destructive: true` step" flag so the executor
+                  skips the non-destructive prefix the upstream step
+                  already walked. For non-skill-card dispatchers, the
+                  equivalent is "start from the first post-gate-boundary
+                  action." Log at INFO level.
+                - FAILURE → graceful degrade: close the dead session
+                  (silent catch — profile lock releases either way),
+                  `launchBrowser`-equivalent a fresh one, set
+                  `resumeAtFirstDestructive: false`. Log at WARN level
+                  (ops signal for tuning gate-wait vs session-TTL).
+
+           4. The session-none branch (upstream step threw before
+              launch) takes the fresh-launch path with no probe.
+
+         Why the pattern matters:
+           - Preserves UX: the happy path skips 3-5s of re-auth per
+             run (a large fraction of runs in a fast-reviewer
+             workflow).
+           - Read-only skills (no destructive step) become a correct
+             no-op at the consumer step — the skip-prefix loop never
+             finds a destructive boundary, stepsRun=0, no wasted work.
+           - Graceful under long reviewer waits: session TTL expiry
+             does not crash the run; the fallback takes the same
+             launchBrowser path unconditional fresh-launch would.
+           - Observable via a single log signature per branch — ops
+             can grep for `reusing live ... session` vs `... session
+             is dead` to trend reviewer-wait-time against session TTL.
+
+         What you do NOT do:
+           - DO NOT unconditionally pre-close and re-launch at every
+             gate transition. That throws away the session-reuse
+             optimization that the gate-aware workflow was designed
+             around. (Rejected as "Path A simple" during the Week-2b
+             runtime review — docs/MASTER_PLAN.md captures the
+             decision.)
+           - DO NOT add a test-only DI seam to production code to
+             cover the fallback branch in unit scope. The fallback
+             is 8 LoC of straight-line logic that mirrors the
+             upstream step's pre-close pattern; live smoke + polish-
+             queue integration test is sufficient coverage.
+
+  4. Consumption-pattern decision — two choices:
+
+     (a) LLM-DRIVEN (the ReAct style): expose the MCP's tools as
+         `ReactTool` entries (see `reactRunner.ts` for the shape) and
+         include them in `createReActStep({ tools: [...] })`. The LLM
+         decides when to call each tool. Good for cognitive steps
+         (classify, verify) where the sequence is not known in advance.
+         No YAML authoring required.
+
+     (b) SKILL-CARD-DRIVEN (the deterministic style): extend the
+         skill-card schema at `src/schemas/skill-card.ts` with a new
+         `action:` type (or a new `tool:` dispatcher enum value). Teach
+         `skillCardExecutor.ts` to dispatch that action/tool type to
+         your MCP session's corresponding `callTool()`. The YAML
+         recipes then compose your MCP's tools deterministically, same
+         as Playwright recipes do today. Good for resolution flows with
+         known, auditable step sequences.
+
+  5. Trust boundary — domain-specific and REQUIRED. Playwright has
+     single-origin pinning; your MCP needs its equivalent:
+       - Filesystem MCP:   root-allowlist (never escape a sandbox dir).
+       - Shell MCP:        command-allowlist (or denylist — pick one
+                           consciously; prefer allowlist).
+       - API MCP:          scoped token, narrow OAuth scopes, per-run
+                           rate limit.
+     Declare the boundary in the wrapper module's docblock. Credentials
+     live in env vars (Zod-validated in `src/env.ts`); never pass
+     plaintext creds through LLM prompts.
+
+  6. Circuit breaker — optional but cheap. Wrap per-callTool
+     invocations in `getCircuit("<service-name>").execute(...)` if the
+     MCP fronts a flaky external (network APIs, rate-limited services).
+     Subprocess spawn itself usually doesn't need it.
+
+  7. Tests — `playwrightMcp.ts`'s test file is the template. With the
+     four injectable hooks you can unit-test spawn args, teardown order,
+     abort propagation, and frame shape WITHOUT actually launching the
+     MCP subprocess. Aim for parity with its coverage (12 tests today).
+
+  What you do NOT touch when adding an MCP: the orchestration engine,
+  workflow chain, reviewer UI, gates, meta-loops, primitives layer.
+  Adding an MCP is a pure tool-layer addition — per the substrate map
+  in `docs/PLATFORM_PIVOTS.md §3`, the rest of the stack doesn't care
+  what's on the other end of `callTool()`.
+
+
 ================================================================================
 10. WHERE TO OPTIMIZE LATER (pointers for future cycles)
 ================================================================================

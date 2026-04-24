@@ -53,12 +53,24 @@ export const SkillStepSchema = z.object({
     "fillForm",
     "takeScreenshot",
   ]),
-  /** Tool-specific args. Validated at runtime in the playwrightMcp
-   *  wrapper (week2b-runtime commit). Foundation just guarantees the
-   *  field exists as an object. */
+  /** Tool-specific args. Resolved at runtime via the template engine
+   *  (`{{ inputs.X }}` → caller-provided values) then dispatched to
+   *  the Playwright MCP wrapper. The shape is validated by the
+   *  executor at dispatch time, not here. */
   args: z.record(z.unknown()),
   /** Optional human-readable annotation for reviewer UI + audit logs. */
   description: z.string().min(1).max(200).optional(),
+  /** Week-2b-runtime — marks a step as destructive (causes state
+   *  change). `dry_run` STOPS BEFORE the first step with this set to
+   *  true; `execute` runs all steps unchanged. Default false
+   *  (back-compat with week2b-foundation cards that omit the field).
+   *
+   *  Cross-field constraint enforced at skill-card load time (NOT in
+   *  this Zod schema — Zod can't express cross-field rules cleanly):
+   *  if the SKILL-level `destructive: true`, at least one step MUST
+   *  carry step-level `destructive: true`. See
+   *  `src/lib/skillCardLoader.ts:assertCrossFieldConstraints`. */
+  destructive: z.boolean().optional(),
 });
 
 export const SkillInputSchema = z.object({

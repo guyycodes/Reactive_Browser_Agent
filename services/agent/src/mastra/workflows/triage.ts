@@ -13,7 +13,6 @@ import {
 } from "../tools/rag.js";
 import {
   launchBrowser,
-  PlaywrightMcpError,
   type BrowserSession,
 } from "../tools/playwrightMcp.js";
 import {
@@ -23,6 +22,30 @@ import {
 } from "../lib/reactRunner.js";
 import { runBlock1 } from "../lib/blockController.js";
 import type { Block1Deps, Block1Result } from "../lib/blockController.js";
+// Week-2b-runtime — skill-card-driven execution primitives. These
+// imports live at the top (not inline) so the module's dependency graph
+// is visible at a glance. `findRefByAccessibleName` + `findRefForRole`
+// were extracted to `tools/domRefs.ts` in-commit; re-exported below for
+// external callers (test/findRef.test.ts).
+import {
+  findRefByAccessibleName,
+  findRefForRole,
+} from "../tools/domRefs.js";
+import {
+  executeSkillCardSteps,
+  type ExecuteSkillResult,
+} from "../tools/skillCardExecutor.js";
+import {
+  loadSkill,
+  loadAllSkills,
+  SkillCardNotFoundError,
+  type LoadedSkill,
+} from "../../lib/skillCardLoader.js";
+import type { Skill, SkillCard } from "../../schemas/skill-card.js";
+import type { TemplateContext } from "../../lib/templateEngine.js";
+// Re-export the ref helpers so test/findRef.test.ts' existing imports
+// from this module keep working without an import-path churn.
+export { findRefByAccessibleName, findRefForRole };
 
 /**
  * The 8-step triage-and-execute workflow (MASTER_PLAN §4).
@@ -732,6 +755,15 @@ export async function runPlanStep(
   {
     const { runId, bus, ticket, priorObservations } = getRunContext();
 
+    // Week-2b-runtime — load the full skill-card catalog so the
+    // planner's system prompt can list every card Sonnet is allowed
+    // to pick. Single filesystem walk at planStep entry; result is
+    // cached in-process by the loader so subsequent runs' planStep
+    // calls are free. Empty catalog is acceptable (e.g., dev env with
+    // kb/ empty) — Sonnet falls back to the custom-plan path.
+    const allSkills = await loadAllSkills();
+    const skillCatalog = buildSkillCatalog(allSkills);
+
     // 7b.ii-hotfix — build a prompt that actually includes the ticket
     // subject + top-5 hits per corpus. Previously Sonnet received only
     // the classification + hit counts, which (correctly) caused it to
@@ -797,17 +829,25 @@ export async function runPlanStep(
       "- Unknown rate-limit counts → the plan discovers this on the user detail page.\n" +
       "- Ambiguity the reviewer can resolve with a single decision at the gate.\n" +
       "\n" +
+      "\nAVAILABLE SKILL CARDS:\n" +
+      "Pre-authored skill cards encode tested UI-action sequences for known IT operations (password reset, account unlock, etc.). If any card matches the ticket, setting `skillCardName` to that card's name tells the runtime to dispatch the card's pre-authored steps — this is STRONGLY preferred over a custom `actions[]` plan whenever a card fits.\n" +
+      "\n" +
+      skillCatalog +
+      "\n" +
+      "If no card in the catalog fits the ticket, set `skillCardName: null` and produce a custom plan via `actions[]`. Do NOT invent skill-card names; hallucinated names trigger a planStep retry (wasted LLM budget).\n" +
+      "\n" +
       "Return ONLY a JSON object matching this schema:\n" +
       "{\n" +
       '  "narrative": string,                      // short prose reasoning\n' +
-      '  "actions": [{                             // [] if requiresContext=true\n' +
+      '  "skillCardName": string | null,           // name from catalog above, or null for a custom actions[] plan\n' +
+      '  "actions": [{                             // [] if requiresContext=true; otherwise narrative/audit array — runtime consumes skillCardName, not this\n' +
       '    "stepNumber": 1,\n' +
       '    "verb": "navigate"|"fill"|"click"|"verify"|"notify",\n' +
       '    "target": string,                       // e.g. "email textbox on /login"\n' +
       '    "value": string | null,                 // null for actions without a value\n' +
       '    "description": string\n' +
       "  }],\n" +
-      '  "destructive": boolean,                   // true iff any action is destructive\n' +
+      '  "destructive": boolean,                   // true iff any action is destructive (overridden by skill-card destructive flag when skillCardName is set)\n' +
       '  "requiresContext": boolean,\n' +
       '  "missingContext": string[]?               // required if requiresContext=true\n' +
       "}\n" +
@@ -978,19 +1018,79 @@ export async function runPlanStep(
     const narrative =
       typeof parsed.narrative === "string" ? parsed.narrative : "";
 
+    // Week-2b-runtime — skill-card resolution.
+    //
+    // Sonnet's JSON output is expected to include an optional
+    // `skillCardName: string | null` field naming a card from the
+    // catalog embedded in the system prompt (see `buildSkillCatalog`
+    // below). If set to a valid name, the runtime loads that card and
+    // uses its authoritative `destructive` flag + populates
+    // `skillCardIds` so dry_run / execute can dispatch it via the
+    // skill-card executor.
+    //
+    // Audit #3 (hallucinated skill name): `loadSkill` throws
+    // `SkillCardNotFoundError` when Sonnet names a card that doesn't
+    // exist on disk. We catch + convert to a `requiresContext: true`
+    // fallback with a diagnostic `missingContext` entry so Block 1's
+    // retry loop can re-run planStep on the next pass (giving Sonnet
+    // a chance to pick a valid name or null). Crashing the run on a
+    // stochastic LLM hallucination is NOT acceptable behavior.
+    const rawSkillCardName =
+      typeof parsed.skillCardName === "string" && parsed.skillCardName.trim()
+        ? parsed.skillCardName.trim()
+        : null;
+    let resolvedSkillCardName: string | null = null;
+    let resolvedDestructive = destructive;
+    let skillCardResolutionError: string | null = null;
+
+    if (rawSkillCardName) {
+      try {
+        const loaded = await loadSkill(rawSkillCardName);
+        resolvedSkillCardName = rawSkillCardName;
+        resolvedDestructive = loaded.skill.destructive;
+      } catch (err) {
+        if (err instanceof SkillCardNotFoundError) {
+          skillCardResolutionError = `planStep picked non-existent skill-card name: ${rawSkillCardName}`;
+          logger.warn(
+            {
+              runId,
+              stepId: "plan",
+              requestedSkillCardName: rawSkillCardName,
+            },
+            "[planStep] Sonnet picked unknown skill-card name; converting to requiresContext fallback",
+          );
+        } else {
+          // Unknown loader error (disk failure, malformed YAML on disk
+          // that sneaked past validate:skill-cards, etc.) → bubble up
+          // to Mastra's exception path. Not a run-recoverable state.
+          throw err;
+        }
+      }
+    }
+
+    // If skill-card resolution failed AND Sonnet didn't flag
+    // requiresContext, we STILL want to emit requiresContext=true so
+    // Block 1 retries (rather than letting dry_run bail on empty
+    // skillCardIds, which is a noisier failure mode).
+    const effectiveRequiresContext = requiresContext || skillCardResolutionError !== null;
+    const effectiveMissingContext: string[] = [
+      ...(missingContextRaw ?? []),
+      ...(skillCardResolutionError ? [skillCardResolutionError] : []),
+    ];
+
     return {
       planId,
       actionCount: actions.length, // authoritative (derived)
-      destructive, // LLM-declared (not regex-inferred)
-      skillCardIds: [],
+      destructive: resolvedDestructive, // skill-card override if resolved; else LLM-declared
+      skillCardIds: resolvedSkillCardName ? [resolvedSkillCardName] : [],
       planText: narrative, // narrative prose for reviewer UI display
       // 7b.iii.b commit 4 (Bug 3A mitigation) — see refusal-path comment above.
       thinking: "",
       classification: inputData.classification,
       actions,
-      requiresContext,
-      ...(missingContextRaw && missingContextRaw.length > 0
-        ? { missingContext: missingContextRaw }
+      requiresContext: effectiveRequiresContext,
+      ...(effectiveMissingContext.length > 0
+        ? { missingContext: effectiveMissingContext }
         : {}),
     };
   }
@@ -1015,50 +1115,33 @@ export async function runDryRunStep(
   inputData: z.infer<typeof PlanSchema>,
   abortSignal: AbortSignal | undefined,
 ): Promise<z.infer<typeof DryRunSchema>> {
-    // Commit 6b: real Playwright MCP against test-webapp. Dry-run is the
-    // READ-ONLY reconnaissance pass — we log in, navigate to the user
-    // detail page, take screenshots the reviewer will see at the review
-    // gate, but we do NOT click the destructive "Reset password" action.
-    // That lands in `executeStep` after human approval.
+    // Week-2b-runtime — skill-card-driven dry_run. Replaces the pre-runtime
+    // hardcoded Jane-reset preflight sequence; all orchestration knowledge
+    // now lives in `kb/skill_cards/<app>/<skill>.yml` + the
+    // `executeSkillCardSteps` dispatcher.
     //
-    // The `BrowserSession` created here is stashed on `RunContext.browser`
-    // so `executeStep` can inherit the logged-in Chromium session —
-    // otherwise `executeStep` would have to redo the login dance every
-    // run, doubling demo latency and duplicating nav frames in the
-    // reviewer UI. The workflow wrapper in `http/triage.ts` owns the
-    // matching `session.close()` in its outer `finally`.
+    // Preserved invariants (unchanged from Week-1B hardcoded flow):
+    //   - hotfix-1 pre-close of any existing ctx.browser session before
+    //     launchBrowser (Bug B lock-collision fix).
+    //   - ctx.browser = session is set on the OUTER context (CTX SPREAD
+    //     INVARIANT — session must propagate to executeStep).
+    //   - Error handling: PlaywrightMcpError → anomalies[] +
+    //     domMatches=false (soft failure); unknown errors re-throw.
+    //
+    // New behavior:
+    //   - If `inputData.skillCardIds` is empty (planStep didn't pick a
+    //     card), emit a dry_run anomaly + domMatches=false. Reviewer UI
+    //     will see "needs context" path via the review_gate.
+    //   - Otherwise, loadSkill(name) + extractInputsForSkill(skill,
+    //     ticket) + executeSkillCardSteps(..., preflight: true).
     const ctx = getRunContext();
-    const { runId, bus } = ctx;
+    const { runId, bus, ticket } = ctx;
 
-    // 7b.iii.b-pre-exec-edit-ui-hotfix-1 — close any prior browser
-    // session before launching a new one. Playwright MCP locks
-    // `.playwright-videos/<runId>/.mcp-profile` per run; re-launching
-    // without an explicit close fails immediately with
-    //   "Browser is already in use, use --isolated to run multiple
-    //   instances of the same browser".
-    //
-    // This trips in TWO scenarios:
-    //   (a) commit 2's refine loop — initial Block 1's dry_run opens
-    //       session A, refine re-runs Block 1 whose dry_run tries to
-    //       open session B → lock collision.
-    //   (b) 7b.iii.a's intra-Block-1 multi-pass — pass 0's dry_run
-    //       leaves a session open, pass 1's dry_run collides the
-    //       same way.
-    //
-    // Retroactive audit on postgres events surfaced 4 prior runs
-    // carrying this error. Bug A (spread-mutation ctx.browser loss,
-    // fixed in 7b.iii.b-2-hotfix-1) was HIDING Bug B's wire signal —
-    // the session reference never survived to executeStep, which
-    // masked the lock collision as a separate downstream
-    // "playwright.session_check: no browser" failure. Fixing A
-    // unmasked B. Self-healing pre-close here covers every caller
-    // uniformly (refine + intra-Block-1 + any future caller) without
-    // splitting browser-lifecycle knowledge across files.
-    //
-    // Silent catch on close() is deliberate: if the prior transport
-    // already died, close() throws but the MCP profile lock is
-    // released regardless, and the subsequent launchBrowser below
-    // will succeed.
+    // hotfix-1 pre-close (preserved from Week-1B for intra-Block-1 +
+    // refine + backtrack re-invocations — avoids MCP profile-lock
+    // collision when a second launchBrowser is issued within the same
+    // runId). Silent catch: if the prior transport already died,
+    // close() throws but the profile lock is released regardless.
     if (ctx.browser) {
       try {
         await ctx.browser.close();
@@ -1066,6 +1149,23 @@ export async function runDryRunStep(
         // Prior session already dead; lock is released.
       }
       ctx.browser = undefined;
+    }
+
+    // Early-out: if planStep didn't pick a skill card (empty
+    // skillCardIds), we can't run any preflight. Emit a soft-failure
+    // anomaly so the review gate sees the diagnostic and the reviewer
+    // can Reject (→ refine with directive) or Terminate. Do NOT
+    // launch the browser — launching + immediately closing on empty
+    // input is wasted work and muddies the forensic fingerprints.
+    if (inputData.skillCardIds.length === 0) {
+      return {
+        domMatches: false,
+        anomalies: [
+          "planStep did not select a skill card; dry_run cannot dispatch. " +
+            "Pre-runtime Jane-hardcoded flow is retired in Week-2b-runtime.",
+        ],
+        plan: inputData,
+      };
     }
 
     const session = await launchBrowser({
@@ -1078,135 +1178,52 @@ export async function runDryRunStep(
 
     const anomalies: string[] = [];
     let domMatches = true;
-    const baseUrl = env("TEST_WEBAPP_URL");
 
     try {
-      // 1. Login page
-      await session.navigate(`${baseUrl}/login`);
-      const loginSnap = await session.snapshot();
-      await session.takeScreenshot("dry_run:login-page");
+      const loaded = await loadSkill(inputData.skillCardIds[0]!);
+      const inputs = extractInputsForSkill(loaded.skill, {
+        ticketId: ticket?.ticketId ?? "(unknown)",
+        subject: ticket?.subject ?? "",
+      });
+      const tctx: TemplateContext = { inputs };
 
-      // Role filters on each lookup guard against ambiguous substring hits.
-      // Specifically: on /login the heading "Sign in" (h1) appears BEFORE
-      // the button "Sign in" — plain findRefByAccessibleName returns the
-      // heading and a subsequent click does nothing. Confirmed by
-      // findRef.test.ts fixtures captured from real MCP output.
-      const emailRef = findRefForRole(loginSnap.text, "textbox", "Email");
-      const passwordRef = findRefForRole(loginSnap.text, "textbox", "Password");
-      const submitRef = findRefForRole(loginSnap.text, "button", "Sign in");
-
-      if (!emailRef || !passwordRef || !submitRef) {
-        anomalies.push(
-          `login refs missing: email=${!!emailRef} password=${!!passwordRef} submit=${!!submitRef}`,
-        );
+      const result = await executeSkillCardSteps(loaded.skill, {
+        preflight: true,
+        ctx: tctx,
+        session,
+        baseUrl: loaded.card.base_url,
+      });
+      // `executeSkillCardSteps` catches `PlaywrightMcpError` internally
+      // (bug-2a fix) and returns partial-progress telemetry via
+      // `result.anomalies`. Non-empty anomalies → preflight aborted
+      // mid-flow → DOM does not match the skill card's expected
+      // structure. Empty anomalies → all preflight steps completed
+      // without throwing; the takeScreenshot outputs in the behavior
+      // feed are evidence the DOM matched.
+      if (result.anomalies.length > 0) {
+        anomalies.push(...result.anomalies);
         domMatches = false;
-      } else {
-        await session.fillForm([
-          { name: "email", type: "textbox", ref: emailRef, value: env("TARGET_APP_USER") },
-          { name: "password", type: "textbox", ref: passwordRef, value: env("TARGET_APP_PASSWORD") },
-        ]);
-        await session.click({ element: "login submit button", ref: submitRef });
-      }
-
-      // 2. After login → /users list lands here (login redirects).
-      await session.navigate(`${baseUrl}/users`);
-      await session.takeScreenshot("dry_run:users-list-initial");
-
-      // 3. Search for "jane". Hardcoded target for 6b; Week-2 skill cards
-      //    will parse the target user out of the ticket subject properly.
-      const usersSnap = await session.snapshot();
-      // Accessible name comes from the `aria-label="Search users"` on the
-      // test-webapp input. The submit button is just "Search". Role filters
-      // matter here because "Search" substring-matches both the textbox
-      // ("Search users") and the button ("Search") — without the filter the
-      // textbox wins and we'd fillForm + click on the input instead of its
-      // submit.
-      // Role is `searchbox` (the implicit ARIA role of `<input type="search">`
-      // — the test-webapp's users search input), NOT `textbox`. Confirmed
-      // empirically in 6b-hotfix-4 live smoke via the diagnostic
-      // `extractLinesMatching` dump, which showed
-      // `searchbox "Search users" [ref=e21]` in the snapshot. The button
-      // lookup was always fine — a plain `button "Search" [ref=e22]`.
-      const searchRef = findRefForRole(usersSnap.text, "searchbox", "Search users");
-      const searchSubmitRef = findRefForRole(usersSnap.text, "button", "Search");
-      if (!searchRef) {
-        // 6b-hotfix-3 live smoke flagged this path as needing a fresh
-        // live-snapshot probe to decide the right role/name — the current
-        // lookup misses on some runs. Dump the lines containing the word
-        // "Search" so the next smoke's anomaly payload tells the reviewer
-        // exactly what to target without needing another deployment cycle.
-        anomalies.push(
-          `search textbox ref missing on /users. snapshot-search-lines: ${extractLinesMatching(usersSnap.text, "search")}`,
-        );
-        domMatches = false;
-      }
-      if (!searchSubmitRef) {
-        anomalies.push(
-          `search submit button ref missing on /users. snapshot-button-lines: ${extractLinesMatching(usersSnap.text, "button")}`,
-        );
-        domMatches = false;
-      }
-      if (searchRef && searchSubmitRef) {
-        await session.fillForm([
-          { name: "search query", type: "textbox", ref: searchRef, value: "jane" },
-        ]);
-        await session.click({ element: "user search submit", ref: searchSubmitRef });
-      }
-      // Skip-search recovery: downstream findRefForRole("link",
-      // "jane@example.com") still works against the FULL (unfiltered) user
-      // list since Jane is one of 20 seeded rows. That's why 6b-hotfix-3
-      // live smoke saw the reset succeed despite these refs missing.
-
-      // 4. Click through to Jane's detail page.
-      const searchResultSnap = await session.snapshot();
-      await session.takeScreenshot("dry_run:users-search-jane");
-      // The test-webapp's users page sets `aria-label="View <name> (<email>)"`
-      // on each row's View link (added in 6b-hotfix-2 for this exact
-      // disambiguation need). Matching on the unique email uniquely selects
-      // Jane's row even when 19 other "View" links are on the page.
-      // Role-filtered to `link` so plain cell text containing the email
-      // (if/when rendered with its own ref) can't accidentally match.
-      const viewRef = findRefForRole(searchResultSnap.text, "link", "jane@example.com");
-      if (!viewRef) {
-        anomalies.push("user-view-u-001 not found in search results");
-        domMatches = false;
-      } else {
-        await session.click({ element: "view Jane Cooper", ref: viewRef });
-      }
-
-      // 5. Snapshot user detail — final dry-run frame. DO NOT click the
-      //    reset-password link; that's executeStep's job.
-      const detailSnap = await session.snapshot();
-      await session.takeScreenshot("dry_run:user-detail");
-      const resetLinkRef = findRefForRole(detailSnap.text, "link", "Reset password");
-      if (!resetLinkRef) {
-        anomalies.push("'Reset password' link not found on user detail — cannot proceed");
-        domMatches = false;
-      }
-      // The status badge on the user detail page renders in Playwright MCP's
-      // snapshot as a `generic` element whose text content is the status
-      // string, e.g. `- generic [ref=e53]: locked`. We explicitly anchor to
-      // that shape — an earlier version used `/\b(active|locked|suspended)\b/`
-      // against the whole snapshot, which picked up MCP's ROOT element's
-      // `[active]` focus marker (the first line of every snapshot is
-      // `- generic [active] [ref=e1]:`) and reported a false-positive
-      // `user-status appears to be 'active'` anomaly on every run. 6c-1
-      // re-smoke exposed the false positive once session isolation cleared
-      // the louder `login refs missing` anomaly; fix landed with 6c-2.
-      const status = extractUserStatus(detailSnap.text);
-      if (status && status.toLowerCase() !== "locked") {
-        anomalies.push(
-          `user-status appears to be '${status}' (expected 'locked' for reset)`,
+        logger.warn(
+          { runId, anomalies: result.anomalies, stepsRun: result.stepsRun },
+          "[dry_run] skill-card preflight aborted mid-flow",
         );
       }
     } catch (err) {
-      if (err instanceof PlaywrightMcpError) {
-        anomalies.push(`playwright-mcp error: ${err.message}`);
+      if (err instanceof SkillInputExtractionError) {
+        anomalies.push(
+          `skill-input extraction failed: missing '${err.missingKey}' input for this skill (ticket: "${ticket?.subject ?? ""}")`,
+        );
         domMatches = false;
         logger.warn(
-          { runId, err: err.message, toolName: err.toolName },
-          "[dry_run] playwright-mcp call failed",
+          { runId, missingKey: err.missingKey, subject: ticket?.subject },
+          "[dry_run] skill-input extraction failed",
         );
+      } else if (err instanceof SkillCardNotFoundError) {
+        // Defensive — planStep already validated the name via loadSkill.
+        // If the card disappeared between planStep and here (extreme
+        // race) fall back cleanly.
+        anomalies.push(`skill card '${err.skillName}' no longer loadable`);
+        domMatches = false;
       } else {
         throw err;
       }
@@ -1468,117 +1485,127 @@ export async function runExecuteStep(
       return { stepsRun: 0, skipped: true, review: inputData };
     }
 
-    const session = ctx.browser;
-    if (!session) {
-      // dryRunStep should have populated RunContext.browser. If it didn't
-      // (e.g. dry_run threw before launchBrowser, or something up-stack
-      // cleared the reference), we can't proceed — but we also shouldn't
-      // crash the run process. Emit a diagnostic tool.failed so the
-      // reviewer UI shows WHY execute returned zero steps, and short-circuit
-      // to verify/log_and_notify which will surface status=failed.
-      const invocationId = randomUUID();
-      bus.publish({
-        runId,
-        stepId: "execute",
-        payload: {
-          type: "tool.started",
-          invocationId,
-          name: "playwright.session_check",
-          args: {},
-        },
-      });
-      bus.publish({
-        runId,
-        stepId: "execute",
-        payload: {
-          type: "tool.failed",
-          invocationId,
-          name: "playwright.session_check",
-          error: {
-            message:
-              "executeStep: no browser session on RunContext — dryRunStep must populate ctx.browser before review_gate",
-            where: "executeStep.session_check",
-          },
-        },
-      });
+    // Week-2b-runtime — skill-card-driven execute. Replaces the
+    // pre-runtime hardcoded Jane-reset click sequence. Executes the
+    // FULL skill-card steps array (preflight: false) — so the
+    // destructive-confirm click that dry_run stopped before gets
+    // executed here after reviewer approval.
+    //
+    // Session handling — liveness-probe + three branches:
+    //   1. ctx.browser alive (happy path, fast reviewer): reuse and
+    //      resume at first destructive step. Skips 3-5s of re-login;
+    //      makes read-only skills (no destructive step) a correct
+    //      no-op at execute.
+    //   2. ctx.browser dead (reviewer sat on gate past session TTL):
+    //      pre-close + fresh launch + run full skill card. Graceful
+    //      degrade; logged at warn level for ops visibility.
+    //   3. ctx.browser undefined (dry_run threw before launch): fresh
+    //      launch + run full skill card. No reuse possible.
+    //
+    // Success evidence lives in the `takeScreenshot` step(s) the skill
+    // card declares; verifyStep (unchanged in 2b) asserts the
+    // postcondition text.
+    if (inputData.dryRun.plan.skillCardIds.length === 0) {
+      // Defensive — review_gate would've seen the dry_run anomaly and
+      // the reviewer would've rejected/terminated. If we somehow
+      // reach execute with an empty skillCardIds, bail cleanly.
       logger.error(
         { runId },
-        "[execute] RunContext.browser is undefined; cannot perform reset",
+        "[execute] no skill card in plan; cannot dispatch",
       );
       return { stepsRun: 0, skipped: false, review: inputData };
     }
 
-    session.setStepId("execute");
-    let stepsRun = 0;
+    const existing = ctx.browser;
+    let session: BrowserSession;
+    let resumeAtFirstDestructive: boolean;
 
-    try {
-      // Re-snapshot Jane's detail page — dry_run left us on it, but between
-      // dry_run and now the reviewer may have waited minutes and the Next.js
-      // page may have re-rendered. One cheap snapshot beats assuming.
-      const detailSnap = await session.snapshot();
-      const resetLinkRef = findRefForRole(detailSnap.text, "link", "Reset password");
-      if (!resetLinkRef) {
-        throw new PlaywrightMcpError(
-          "'Reset password' link not found on user detail page",
-          undefined,
-          "playwright.browser_snapshot",
+    if (existing) {
+      // Tag the session with the execute stepId BEFORE the probe so
+      // the probe's tool.started/tool.completed frames attribute to
+      // execute (not stale dry_run). If the probe fails we close this
+      // session immediately anyway; the mutation costs nothing.
+      existing.setStepId("execute");
+      try {
+        await existing.snapshot();
+        session = existing;
+        resumeAtFirstDestructive = true;
+        logger.info(
+          { runId },
+          "[execute] reusing live dry_run session; resuming at first destructive step",
         );
-      }
-      await session.click({
-        element: "Reset password link on user detail",
-        ref: resetLinkRef,
-      });
-      stepsRun++;
-
-      // Reset-password confirm page. Check the box, click submit.
-      const confirmSnap = await session.snapshot();
-      await session.takeScreenshot("execute:reset-confirm");
-      // The checkbox's accessible name is the visible label text:
-      // "I confirm I want to reset <name>'s password." — substring match on
-      // "I confirm" is stable across user names. Role filter is defensive.
-      const checkRef = findRefForRole(confirmSnap.text, "checkbox", "I confirm");
-      // The destructive submit — role-filtered to disambiguate from the
-      // page heading "Reset password for <name>" which also substring-
-      // matches "Reset password".
-      const submitRef = findRefForRole(confirmSnap.text, "button", "Reset password");
-      if (!checkRef || !submitRef) {
-        throw new PlaywrightMcpError(
-          `reset form refs missing: check=${!!checkRef} submit=${!!submitRef}`,
-          undefined,
-          "playwright.browser_snapshot",
-        );
-      }
-      await session.click({
-        element: "confirm checkbox for destructive reset",
-        ref: checkRef,
-      });
-      stepsRun++;
-      await session.click({ element: "Reset password submit button", ref: submitRef });
-      stepsRun++;
-
-      // Success page — snapshot + screenshot so verify/log_and_notify have
-      // proof-of-completion. The reset-success toast's accessible name is
-      // "Password reset successful" (the `<strong>` inside the toast's
-      // role="status" region).
-      const successSnap = await session.snapshot();
-      await session.takeScreenshot("execute:after-reset");
-      if (!/password reset successful/i.test(successSnap.text)) {
-        throw new PlaywrightMcpError(
-          "reset-success marker not found on post-submit page",
-          undefined,
-          "playwright.browser_snapshot",
-        );
-      }
-      stepsRun++;
-    } catch (err) {
-      // On MCP-side failure: the session wrapper has already emitted
-      // tool.failed for us; we just log and return the partial count.
-      // Mastra will observe no throw and the workflow proceeds to verify,
-      // which reports needs-review given stepsRun < 4.
-      if (err instanceof PlaywrightMcpError) {
+      } catch (err) {
         logger.warn(
-          { runId, err: err.message, toolName: err.toolName, stepsRun },
-          "[execute] playwright-mcp call failed mid-flow",
+          { runId, err: (err as Error).message },
+          "[execute] dry_run session is dead; falling back to fresh launch",
+        );
+        try {
+          await existing.close();
+        } catch {
+          // Prior transport already dead; profile lock released.
+        }
+        ctx.browser = undefined;
+        session = await launchBrowser({
+          runId,
+          bus,
+          stepId: "execute",
+          // Pre-existing polish-queue gap: runExecuteStep's Mastra
+          // wrapper doesn't forward abortSignal; tracked separately.
+          signal: undefined,
+        });
+        ctx.browser = session;
+        resumeAtFirstDestructive = false;
+      }
+    } else {
+      session = await launchBrowser({
+        runId,
+        bus,
+        stepId: "execute",
+        signal: undefined,
+      });
+      ctx.browser = session;
+      resumeAtFirstDestructive = false;
+    }
+
+    let stepsRun = 0;
+    try {
+      const loaded = await loadSkill(inputData.dryRun.plan.skillCardIds[0]!);
+      const inputs = extractInputsForSkill(loaded.skill, {
+        ticketId: ctx.ticket?.ticketId ?? "(unknown)",
+        subject: ctx.ticket?.subject ?? "",
+      });
+      const tctx: TemplateContext = { inputs };
+
+      const result: ExecuteSkillResult = await executeSkillCardSteps(
+        loaded.skill,
+        {
+          preflight: false,
+          resumeAtFirstDestructive,
+          ctx: tctx,
+          session,
+          baseUrl: loaded.card.base_url,
+        },
+      );
+      stepsRun = result.stepsRun;
+      if (result.anomalies.length > 0) {
+        // bug-2a fix — executor captured PlaywrightMcpError mid-flow
+        // and returned partial stepsRun. Surface for ops; the session
+        // wrapper already emitted tool.failed for the UI.
+        logger.warn(
+          { runId, anomalies: result.anomalies, stepsRun },
+          "[execute] skill-card aborted mid-flow; partial stepsRun recorded",
+        );
+      }
+    } catch (err) {
+      if (err instanceof SkillInputExtractionError) {
+        logger.warn(
+          { runId, missingKey: err.missingKey },
+          "[execute] skill-input extraction failed mid-run",
+        );
+      } else if (err instanceof SkillCardNotFoundError) {
+        logger.error(
+          { runId, skillName: err.skillName },
+          "[execute] skill card no longer loadable",
         );
       } else {
         throw err;
@@ -2275,45 +2302,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Extract the `ref=<id>` that `@playwright/mcp`'s `browser_snapshot` assigns
- *  to the element whose accessible name contains `needle` (case-insensitive
- *  substring match on the quoted-name token).
- *
- *  Playwright MCP's snapshot is an accessibility tree — each line looks like:
- *
- *      textbox "Email" [ref=e12]
- *      button "Sign in" [ref=e16] [cursor=pointer]
- *      link "View Jane Cooper (jane@example.com)" [ref=e54] [cursor=pointer]
- *
- *  It does NOT expose `data-testid` attributes — only role, accessible name,
- *  and ref. Our earlier `findRefForTestId` scanned for the testid string and
- *  never found a match on a real snapshot (6b-hotfix live smoke). Case-
- *  insensitive substring matching on the captured name lets callers pass
- *  either an exact accessible name ("Email") or a distinguishing substring
- *  ("jane@example.com" against the disambiguated "View Jane Cooper (jane@…)").
- *
- *  Exported for unit testing; Week-2 skill cards will replace this regex
- *  parser with a proper YAML walker (role filters, state predicates, etc.). */
-export function findRefByAccessibleName(
-  snapshot: string,
-  needle: string,
-): string | null {
-  return matchSnapshot(snapshot, needle, null);
-}
-
-/** Role-filtered variant. Needed on pages where the same accessible name
- *  appears on two different roles (e.g. the reset-password confirm page
- *  has a breadcrumb `link "Reset password"` AND a destructive
- *  `button "Reset password"` — plain `findRefByAccessibleName` returns the
- *  first match in YAML order, which is the link, not the button we want
- *  to click). Pass `role="button"` to filter. */
-export function findRefForRole(
-  snapshot: string,
-  role: string,
-  needle: string,
-): string | null {
-  return matchSnapshot(snapshot, needle, role.toLowerCase());
-}
+// Ref-lookup helpers live at the top of the module (imported +
+// re-exported there). Week-2c tools/ consolidation will collapse
+// the re-export if + when a second consumer appears beyond
+// test/findRef.test.ts.
 
 /** Extract the user-status text from a Playwright MCP snapshot of the
  *  test-webapp user-detail page. The status badge renders as a YAML row
@@ -2354,32 +2346,84 @@ function extractLinesMatching(snapshot: string, needle: string): string {
   return matches.length === 0 ? `(no lines contain '${needle}')` : matches.join(" | ");
 }
 
-function matchSnapshot(
-  snapshot: string,
-  needle: string,
-  roleFilter: string | null,
-): string | null {
-  if (!snapshot || !needle) return null;
-  const needleLower = needle.toLowerCase();
-  // Capture: 1 = role, 2 = accessible name, 3 = ref
-  //
-  // Lazy `.*?` between the quoted name and `[ref=...]` because a line may
-  // carry multiple bracketed attributes before the ref token, e.g.:
-  //     heading "Reset password for Jane" [level=1] [ref=e10]
-  //     button "Sign in" [ref=e16] [cursor=pointer]
-  //     link "View Jane (jane@example.com)" [ref=e21] [cursor=pointer]
-  const lineRe = /^\s*(?:- )?(\S+)\s+"([^"]+)".*?\[ref=([a-z0-9_-]+)\]/i;
-  for (const line of snapshot.split("\n")) {
-    const m = lineRe.exec(line);
-    if (!m) continue;
-    const role = (m[1] ?? "").toLowerCase();
-    const name = (m[2] ?? "").toLowerCase();
-    const ref = m[3];
-    if (!ref) continue;
-    if (roleFilter && role !== roleFilter) continue;
-    if (name.includes(needleLower)) return ref;
+/** Week-2b-runtime — render the skill-card catalog for Sonnet's
+ *  planner prompt. Each line is `  - <name> (destructive|safe): <description>`
+ *  so the model can pattern-match a candidate by name. Empty catalog
+ *  returns a placeholder that tells the model to fall through to a
+ *  custom plan. Bounded at ~2 KiB (description capped at 240 chars)
+ *  so Sonnet's prompt doesn't balloon on a large skill library.
+ *
+ *  Audit #2 (hits[].source unrecoverable): this function is the WHY
+ *  planStep doesn't try to parse skill names from RAG retrieval
+ *  hits — the rag cleaner renames input files to
+ *  `clean_docs/<uuid>/finished.txt`, so the original
+ *  `skill_<app>_<name>_<uuid>.html` filename is lost after ingest.
+ *  Listing the full catalog directly (from the filesystem via
+ *  `loadAllSkills`) is both simpler and avoids the parsing concern
+ *  entirely. `retrieveSkillCardsByIntent` stays available for future
+ *  ReAct-plan uses (semantic relevance signal) but is not consumed
+ *  here in 2b-runtime. */
+function buildSkillCatalog(
+  skills: Map<string, LoadedSkill>,
+): string {
+  if (skills.size === 0) {
+    return "  (no skill cards authored yet — produce a custom plan)\n";
   }
-  return null;
+  const lines: string[] = [];
+  for (const loaded of skills.values()) {
+    const flag = loaded.skill.destructive ? "destructive" : "safe";
+    const desc = loaded.skill.description.replace(/\s+/g, " ").slice(0, 240);
+    lines.push(`  - ${loaded.skill.name} (${flag}): ${desc}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** Week-2b-runtime — populate a `TemplateContext.inputs` map from the
+ *  ambient ticket + env, according to the skill's declared `inputs`
+ *  spec. MVP heuristic: regex-extract email from the ticket subject,
+ *  pull operator_email from env, use ticket.ticketId for ticket_id.
+ *  Throws `SkillInputExtractionError` if a required input is declared
+ *  by the skill but cannot be populated. Week-3+ plans to replace the
+ *  heuristic extraction with an LLM-based extractor that reads the
+ *  ticket subject/body and fills the inputs; for MVP the Jane smoke
+ *  ticket ("Reset password for jane@example.com") hits the email
+ *  regex reliably. */
+export class SkillInputExtractionError extends Error {
+  public readonly missingKey: string;
+  constructor(missingKey: string, ticketSubject: string) {
+    super(
+      `Skill required input '${missingKey}' could not be extracted from ticket subject: "${ticketSubject}". ` +
+        `Week-3 will add LLM-based input extraction; for MVP, ensure the ticket subject contains an email address for the 'email' input.`,
+    );
+    this.name = "SkillInputExtractionError";
+    this.missingKey = missingKey;
+  }
+}
+
+export function extractInputsForSkill(
+  skill: Skill,
+  ticket: { ticketId: string; subject: string },
+): Record<string, string> {
+  const inputs: Record<string, string> = {};
+  if (skill.inputs) {
+    if ("email" in skill.inputs) {
+      const m = ticket.subject.match(/[\w.+-]+@[\w.-]+\.\w+/);
+      if (m) inputs.email = m[0];
+    }
+    if ("operator_email" in skill.inputs) {
+      inputs.operator_email = env("TARGET_APP_USER");
+    }
+    if ("ticket_id" in skill.inputs) {
+      inputs.ticket_id = ticket.ticketId;
+    }
+    // Assert every REQUIRED input was populated.
+    for (const [key, spec] of Object.entries(skill.inputs)) {
+      if (spec.required && !(key in inputs)) {
+        throw new SkillInputExtractionError(key, ticket.subject);
+      }
+    }
+  }
+  return inputs;
 }
 
 /** Read an env value at call time without cycling through `../env.js`

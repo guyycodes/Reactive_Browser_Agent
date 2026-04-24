@@ -52,14 +52,18 @@ skills:
       - tool: fillForm
         args:
           fields:
-            - name: Search
+            - name: Search users
               value: "{{ inputs.email }}"
       - tool: click
         args:
-          element: "View link on target user row"
+          element: "Search button"
+      - tool: click
+        args:
+          element: "{{ inputs.email }} link"
       - tool: click
         args:
           element: "Unlock account button"
+        destructive: true
       - tool: takeScreenshot
         args:
           label: "after-unlock"
