@@ -1049,9 +1049,16 @@ Not blockers — just "here's where you'd look" when the time comes.
   • PROMPTS: every LLM prompt is a string in `triage.ts`. Centralizing them
     into `src/llm/prompts.ts` with versioning + A/B hooks is Week-3-ish.
 
-  • SKILL CARDS (Week 2): replace the hardcoded Jane password-reset flow in
-    `runDryRunStep` / `runExecuteStep` with a YAML-driven skill-card
-    executor. Schema sketch in MASTER_PLAN §3.2.
+  • SKILL CARDS (Week 2 — ✅ landed in `week2b-skill-cards-runtime`):
+    `runDryRunStep` + `runExecuteStep` dispatch through
+    `executeSkillCardSteps` against YAML skill cards at
+    `kb/skill_cards/<app>/<skill>.yml`. Schema at
+    `services/agent/src/schemas/skill-card.ts`; loader at
+    `src/lib/skillCardLoader.ts`; template engine at
+    `src/lib/templateEngine.ts`; executor at
+    `src/mastra/tools/skillCardExecutor.ts`. Session-reuse-for-
+    stateful-MCP pattern codified at §9.7 "SESSION-REUSE PATTERN"
+    block.
 
   • REACT EVERYWHERE (Week 2): apply `createReActStep` to classify / plan /
     verify (today only retrieve uses it). See §9.5.
