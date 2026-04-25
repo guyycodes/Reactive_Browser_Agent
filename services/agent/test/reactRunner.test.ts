@@ -6,7 +6,9 @@ import type { TimelineFrame, TimelineFramePayload } from "../src/events/envelope
 import { withRunContext } from "../src/mastra/runContext.js";
 import {
   runReActIterations,
+  REACT_FINAL_SENTINEL,
   type ReactTool,
+  type CreateReActStepArgs,
 } from "../src/mastra/lib/reactRunner.js";
 import type { StreamResult } from "../src/llm/streamMapper.js";
 
@@ -567,5 +569,278 @@ describe("reactRunner — runReActIterations", () => {
       "outer-marker-1",
       "outer-marker-2",
     ]);
+  });
+
+  // ---------- week2d Part 1 — REACT_FINAL_SENTINEL mechanism ----------
+  //
+  // [9]-[12] guard the general-purpose early-termination sentinel a tool
+  // can opt into by returning `{ ...output, [REACT_FINAL_SENTINEL]: true }`.
+  // Runner detects the sentinel after invoke, strips it from the stored
+  // output, flips the iteration's `final` field to true, and breaks the
+  // loop. Name-agnostic — the runner MUST NOT branch on tool.name.
+
+  it("[9] REACT_FINAL_SENTINEL: sentinel-returning tool breaks loop early even if i+1 < maxIter", async () => {
+    scriptNext({
+      toolUses: [
+        { id: "t1", name: "sentinel_tool", input: { query: "q" } },
+      ],
+    });
+    // Script a 2nd + 3rd iteration that WOULD run if the sentinel didn't
+    // terminate. If the loop correctly breaks, these never pop from the
+    // queue. The default-queue-empty fallback in the mock would produce
+    // an `end_turn` text-only iteration, which is what would make the
+    // test still pass incorrectly if the break were missing — so we
+    // also assert iterations.length === 1 explicitly below.
+    scriptNext({ text: "should never see this" });
+    scriptNext({ text: "nor this" });
+
+    const sentinelTool: ReactTool<{ query: string }, { flag: boolean }> = {
+      name: "sentinel_tool",
+      description: "Tool that opts into early termination",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+      validator: z.object({ query: z.string().min(1) }),
+      invoke: async () =>
+        ({
+          flag: true,
+          [REACT_FINAL_SENTINEL]: true,
+        }) as unknown as { flag: boolean },
+      summarize: (o) => `flag=${o.flag}`,
+    };
+
+    const bus = new EventBus({ ringBufferSize: 64 });
+    let capturedIters: Parameters<
+      NonNullable<CreateReActStepArgs<TestIn, TestOut>["produceOutput"]>
+    >[0] = [];
+    await withRunContext({ runId: RUN_ID, bus }, () =>
+      runReActIterations<TestIn, TestOut>(
+        { hint: "h" },
+        undefined,
+        {
+          id: "classify" as const,
+          inputSchema: z.object({ hint: z.string() }),
+          outputSchema: z.object({
+            iterations: z.number(),
+            finalIterationIdx: z.number(),
+            lastToolCalled: z.string().nullable(),
+          }),
+          tier: "sonnet",
+          maxIterations: 3,
+          tools: { sentinel_tool: sentinelTool },
+          buildSystem: () => "sys",
+          buildUserMessage: () => "user",
+          produceOutput: (iters) => {
+            capturedIters = iters;
+            return {
+              iterations: iters.length,
+              finalIterationIdx: iters.findIndex((it) => it.final),
+              lastToolCalled: iters[iters.length - 1]?.toolCall?.name ?? null,
+            };
+          },
+        },
+      ),
+    );
+
+    expect(capturedIters.length).toBe(1);
+    expect(capturedIters[0].toolCall?.name).toBe("sentinel_tool");
+  });
+
+  it("[10] REACT_FINAL_SENTINEL: sentinel is stripped from iter.toolCall.output — produceOutput never sees it", async () => {
+    scriptNext({
+      toolUses: [{ id: "t1", name: "sentinel_tool", input: { query: "q" } }],
+    });
+
+    const sentinelTool: ReactTool<
+      { query: string },
+      { element: string; scaffoldMatch: boolean }
+    > = {
+      name: "sentinel_tool",
+      description: "Tool that opts into early termination",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+      validator: z.object({ query: z.string().min(1) }),
+      invoke: async () =>
+        ({
+          element: "Reset password button",
+          scaffoldMatch: true,
+          [REACT_FINAL_SENTINEL]: true,
+        }) as unknown as { element: string; scaffoldMatch: boolean },
+      summarize: (o) => `element=${o.element}`,
+    };
+
+    const bus = new EventBus({ ringBufferSize: 64 });
+    let capturedOutput: unknown = null;
+    await withRunContext({ runId: RUN_ID, bus }, () =>
+      runReActIterations<TestIn, TestOut>(
+        { hint: "h" },
+        undefined,
+        {
+          id: "classify" as const,
+          inputSchema: z.object({ hint: z.string() }),
+          outputSchema: z.object({
+            iterations: z.number(),
+            finalIterationIdx: z.number(),
+            lastToolCalled: z.string().nullable(),
+          }),
+          tier: "sonnet",
+          maxIterations: 3,
+          tools: { sentinel_tool: sentinelTool },
+          buildSystem: () => "sys",
+          buildUserMessage: () => "user",
+          produceOutput: (iters) => {
+            capturedOutput = iters[0].toolCall?.output;
+            return {
+              iterations: iters.length,
+              finalIterationIdx: iters.findIndex((it) => it.final),
+              lastToolCalled: iters[0].toolCall?.name ?? null,
+            };
+          },
+        },
+      ),
+    );
+
+    expect(capturedOutput).toBeDefined();
+    expect(capturedOutput).not.toBeNull();
+    // Sentinel key MUST NOT be on the stored output — produceOutput
+    // consumers declare a clean TOutput type and should never see it.
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        capturedOutput as object,
+        REACT_FINAL_SENTINEL,
+      ),
+    ).toBe(false);
+    // Original fields ARE preserved.
+    expect(capturedOutput).toMatchObject({
+      element: "Reset password button",
+      scaffoldMatch: true,
+    });
+  });
+
+  it("[11] REACT_FINAL_SENTINEL: react.iteration.completed frame emits normally with toolUsed set + frame-level final:false", async () => {
+    scriptNext({
+      toolUses: [{ id: "t1", name: "sentinel_tool", input: { query: "q" } }],
+    });
+
+    const sentinelTool: ReactTool<{ query: string }, { ack: boolean }> = {
+      name: "sentinel_tool",
+      description: "",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+      validator: z.object({ query: z.string().min(1) }),
+      invoke: async () =>
+        ({
+          ack: true,
+          [REACT_FINAL_SENTINEL]: true,
+        }) as unknown as { ack: boolean },
+      summarize: () => "ack",
+    };
+
+    const bus = new EventBus({ ringBufferSize: 64 });
+    await withRunContext({ runId: RUN_ID, bus }, () =>
+      runReActIterations<TestIn, TestOut>(
+        { hint: "h" },
+        undefined,
+        {
+          id: "classify" as const,
+          inputSchema: z.object({ hint: z.string() }),
+          outputSchema: z.object({
+            iterations: z.number(),
+            finalIterationIdx: z.number(),
+            lastToolCalled: z.string().nullable(),
+          }),
+          tier: "sonnet",
+          maxIterations: 3,
+          tools: { sentinel_tool: sentinelTool },
+          buildSystem: () => "sys",
+          buildUserMessage: () => "user",
+          produceOutput: (iters) => ({
+            iterations: iters.length,
+            finalIterationIdx: iters.findIndex((it) => it.final),
+            lastToolCalled: iters[0].toolCall?.name ?? null,
+          }),
+        },
+      ),
+    );
+
+    const buckets = bucketByType(bus);
+    const completed = buckets["react.iteration.completed"] ?? [];
+    // Exactly one iteration, thus exactly one completion frame.
+    expect(completed).toHaveLength(1);
+    const frame = completed[0] as {
+      type: string;
+      iteration: number;
+      final: boolean;
+      toolUsed?: string;
+    };
+    expect(frame.toolUsed).toBe("sentinel_tool");
+    // Frame-level `final` tracks "LLM emitted end_turn" — NOT the
+    // runner-loop termination. Sentinel-terminated iterations leave
+    // frame.final === false. (Polish-queue #24 tracks the asymmetry.)
+    expect(frame.final).toBe(false);
+  });
+
+  it("[12] REACT_FINAL_SENTINEL: iterations[last].final === true after sentinel break (produceOutput contract)", async () => {
+    scriptNext({
+      toolUses: [{ id: "t1", name: "sentinel_tool", input: { query: "q" } }],
+    });
+
+    const sentinelTool: ReactTool<{ query: string }, { ack: boolean }> = {
+      name: "sentinel_tool",
+      description: "",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+      validator: z.object({ query: z.string().min(1) }),
+      invoke: async () =>
+        ({
+          ack: true,
+          [REACT_FINAL_SENTINEL]: true,
+        }) as unknown as { ack: boolean },
+      summarize: () => "ack",
+    };
+
+    const bus = new EventBus({ ringBufferSize: 64 });
+    let lastIterFinal: boolean | null = null;
+    await withRunContext({ runId: RUN_ID, bus }, () =>
+      runReActIterations<TestIn, TestOut>(
+        { hint: "h" },
+        undefined,
+        {
+          id: "classify" as const,
+          inputSchema: z.object({ hint: z.string() }),
+          outputSchema: z.object({
+            iterations: z.number(),
+            finalIterationIdx: z.number(),
+            lastToolCalled: z.string().nullable(),
+          }),
+          tier: "sonnet",
+          maxIterations: 3,
+          tools: { sentinel_tool: sentinelTool },
+          buildSystem: () => "sys",
+          buildUserMessage: () => "user",
+          produceOutput: (iters) => {
+            lastIterFinal = iters[iters.length - 1].final;
+            return {
+              iterations: iters.length,
+              finalIterationIdx: iters.findIndex((it) => it.final),
+              lastToolCalled: iters[0].toolCall?.name ?? null,
+            };
+          },
+        },
+      ),
+    );
+
+    expect(lastIterFinal).toBe(true);
   });
 });

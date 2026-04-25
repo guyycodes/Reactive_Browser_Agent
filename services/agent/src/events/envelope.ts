@@ -40,6 +40,14 @@ export const StepIdSchema = z.enum([
   "plan",
   "dry_run",
   "review_gate",
+  // week2d Part 3 — inserted between review_gate (approve path) and
+  // execute. Materializes the agent's dry_run actionTrace into an
+  // ephemeral Skill stored on RunContext.tempSkillCard, which execute
+  // walks via executeSkillCardSteps. See triage.ts
+  // runMaterializeSkillCardStep + MaterializeSchema. Also invoked
+  // directly from humanVerifyGateStep's backtrack loop between the
+  // reviewGate + execute direct-invokes.
+  "materialize_skill_card",
   "execute",
   "verify",
   // Commit 7b.iii.b — second human gate, post-execution. The workflow

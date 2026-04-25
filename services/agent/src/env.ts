@@ -59,6 +59,14 @@ const rawSchema = z.object({
   ANTHROPIC_CIRCUIT_WINDOW_MS: z.coerce.number().int().min(1_000).max(600_000).default(60_000),
   ANTHROPIC_CIRCUIT_COOLDOWN_MS: z.coerce.number().int().min(500).max(600_000).default(30_000),
 
+  // week2d Part 2 — agentic dry_run iteration cap. Boot-validated
+  // clamp [1..50]; at-call-site `resolveDryRunMaxIterations` in
+  // triage.ts re-clamps defensively and falls through to 15 on any
+  // invalid read (belt-and-suspenders since triage.ts reads via
+  // process.env.DRY_RUN_MAX_ITERATIONS not this singleton — see env.ts
+  // docblock on the `env()` helper in triage.ts for rationale).
+  DRY_RUN_MAX_ITERATIONS: z.coerce.number().int().min(1).max(50).optional(),
+
   // WS Origin allowlist (browser-enforced only; real auth lands Week 3).
   // Includes both localhost and 127.0.0.1 variants because VS Code port
   // forwarding uses 127.0.0.1 and browsers treat the two as distinct origins.

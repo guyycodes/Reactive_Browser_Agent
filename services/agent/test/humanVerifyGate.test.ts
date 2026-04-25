@@ -206,6 +206,9 @@ describe("humanVerifyGateStep — gate + backtrack control flow (7b.iii.b)", () 
             domMatches: true,
             anomalies: [],
             plan: {} as never,
+            // week2d Part 2 — required DryRunSchema fields.
+            actionTrace: [],
+            boundaryReached: null,
           },
         },
       },
@@ -454,5 +457,65 @@ describe("humanVerifyGateStep — gate + backtrack control flow (7b.iii.b)", () 
     // guard in triage.ts reads inputData.skipped only and never
     // references backtrackCount (which isn't initialized yet at
     // this site).
+  });
+
+  it("[8] week2d Part 3b — backtrack loop plumbs runMaterializeSkillCardStep between runReviewGateStep and runExecuteStep (tracker #19 regression guard)", async () => {
+    // runMaterializeSkillCardStep is exported with the
+    // backtrack-compatible signature (dryRun, review) → MaterializeSchema.
+    const triage = await import("../src/mastra/workflows/triage.js");
+    expect(typeof triage.runMaterializeSkillCardStep).toBe("function");
+    expect(triage.runMaterializeSkillCardStep.length).toBe(2);
+
+    // Source-level regression: the humanVerifyGateStep backtrack body
+    // MUST invoke runMaterializeSkillCardStep between runReviewGateStep
+    // and runExecuteStep. If a future refactor drops or reorders the
+    // call, execute reads a stale ctx.tempSkillCard (or skipped-sentinel
+    // on the fresh backtrack's first pass). This grep is fragile by
+    // design — it's cheaper than wiring a full Mastra-integration run
+    // for a structural guard. See Part 3 RFC §8 + tracker #19.
+    const fs = await import("node:fs/promises");
+    const url = await import("node:url");
+    const src = await fs.readFile(
+      url.fileURLToPath(
+        new URL(
+          "../src/mastra/workflows/triage.ts",
+          import.meta.url,
+        ),
+      ),
+      "utf-8",
+    );
+    // Narrow: must see reviewGate → materialize → execute → verify, in
+    // that order, inside one backtrack-loop block. `[\s\S]*?` is
+    // non-greedy so we don't cross unrelated function bodies.
+    expect(src).toMatch(
+      /runReviewGateStep\s*\(\s*gate1InputDry[\s\S]*?runMaterializeSkillCardStep\s*\([\s\S]*?runExecuteStep\s*\([\s\S]*?runVerifyStep\s*\(/,
+    );
+  });
+
+  it("[9] week2e: backtrack loop preserves ticket (incl. targetUrl) by passing the outer ticket closure into runBlock1", async () => {
+    // Dynamic URL injection (week2e-dynamic-target-url) relies on
+    // ticket.targetUrl surviving across backtracks. The backtrack
+    // loop invokes runBlock1(ticket, buildBlock1Deps(), { ... }) with
+    // `ticket` captured from the outer humanVerifyGateStep closure —
+    // never re-constructed, never re-read from a mutated source. If
+    // a future refactor replaces that with `{ ...ticket, targetUrl:
+    // undefined }` or re-derives ticket from a fresh source, URL
+    // overrides would drop on backtrack (Jane-reset on corrected URL
+    // would revert to scaffold default after post-exec reject).
+    // Source-level regex catches the drift.
+    const fs = await import("node:fs/promises");
+    const url = await import("node:url");
+    const src = await fs.readFile(
+      url.fileURLToPath(
+        new URL(
+          "../src/mastra/workflows/triage.ts",
+          import.meta.url,
+        ),
+      ),
+      "utf-8",
+    );
+    // Match: `runBlock1(ticket, buildBlock1Deps()` — verbatim ticket
+    // passthrough, no spread/override.
+    expect(src).toMatch(/runBlock1\s*\(\s*ticket\s*,\s*buildBlock1Deps\s*\(\s*\)/);
   });
 });

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventBus } from "../events/bus.js";
 import type { BrowserSession } from "./tools/playwrightMcp.js";
+import type { Skill } from "../schemas/skill-card.js";
 
 /**
  * Per-run ambient context, carried through async boundaries via
@@ -35,7 +36,7 @@ import type { BrowserSession } from "./tools/playwrightMcp.js";
  *
  * Field mutability classification (current):
  *   - Read-only-safe to spread:
- *       `runId`, `bus`, `ticket`, `priorObservations`.
+ *       `runId`, `bus`, `ticket`, `priorObservations`, `tempSkillCard`.
  *     These are only READ from the ambient ctx (see prompt builders
  *     in triage.ts). Spread copies work because callees don't mutate
  *     them.
@@ -121,6 +122,13 @@ export interface RunContext {
     ticketId: string;
     subject: string;
     submittedBy?: string;
+    /** week2e-dynamic-target-url — optional URL override carried from
+     *  /triage intake. When present, plan copies to `PlanSchema.targetUrl`
+     *  and downstream baseUrl resolution uses it in place of the
+     *  scaffold's declared `base_url`. Absent by default (scaffolds stay
+     *  authoritative). Enforced http(s) at intake; production allowlist
+     *  is polish-queue #28. */
+    targetUrl?: string;
   };
   /** Commit 7b.iii.a — observations carried forward across Block 1
    *  iteration passes. READ-ONLY from the ambient ctx by
@@ -153,6 +161,14 @@ export interface RunContext {
    *  controller seeds its internal `observations` array from opts
    *  on entry, which IS read during each pass's cognitive spread. */
   priorObservations?: string[];
+  /** week2d Part 3 — ephemeral materialized skill card. Written ONCE
+   *  by `runMaterializeSkillCardStep` after review_gate approves;
+   *  READ by `runExecuteStep` (walks steps) and `runVerifyStep`
+   *  (reads postconditions). NEVER re-written after materialize
+   *  completes. Read-only-safe-to-spread (see CTX SPREAD INVARIANT
+   *  docblock above). Absent on classify / retrieve / plan / dry_run /
+   *  review_gate / log_and_notify. */
+  tempSkillCard?: Skill;
 }
 
 const runContextStorage = new AsyncLocalStorage<RunContext>();

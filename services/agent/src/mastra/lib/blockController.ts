@@ -136,12 +136,45 @@ interface PlanOutput {
   }>;
   requiresContext: boolean;
   missingContext?: string[];
+  /** week2d Part 3 — template-substitution values extracted by plan.
+   *  Defaulted to `{}` on the schema side (`z.record(z.string()).default({})`)
+   *  so existing callers don't break; populated for-real by the plan
+   *  prompt update (Part 3b). */
+  inputs: Record<string, string>;
+  /** week2e-dynamic-target-url — optional target URL override. See
+   *  PlanSchema.targetUrl docblock in triage.ts for resolution
+   *  precedence. Mirrored here so block-controller-internal consumers
+   *  (none today, but future Block-1 gates might want it) stay typed. */
+  targetUrl?: string;
 }
 
+/** week2d Part 2 — widened to carry actionTrace + boundaryReached so
+ *  block1ResultToDryRun can forward them on happy-path exit (when
+ *  dry_run produced a trace + boundary signal). Exhausted-passes paths
+ *  populate `[]` + `null`. Optional on this internal type because Part 2
+ *  ships parallel-operation (execute doesn't read them yet); Part 3
+ *  makes them load-bearing for the materializer. */
 interface DryRunOutput {
   domMatches: boolean;
   anomalies: string[];
   plan: PlanOutput;
+  actionTrace?: Array<{
+    tool:
+      | "browser_navigate"
+      | "browser_snapshot"
+      | "browser_click"
+      | "browser_fillForm"
+      | "browser_takeScreenshot";
+    args: Record<string, unknown>;
+    destructive?: boolean;
+    screenshotPath?: string;
+  }>;
+  boundaryReached?: {
+    element: string;
+    reason: string;
+    scaffoldMatch: boolean | null;
+    iteration: number;
+  } | null;
 }
 
 export interface Block1Result {
@@ -172,6 +205,12 @@ export interface Block1Deps {
   runDryRun: (
     input: PlanOutput,
     signal: AbortSignal | undefined,
+    /** week2d Part 2 hotfix-1 — observations carried forward from
+     *  refine/backtrack loops. Threaded through to dry_run's LLM
+     *  prompt so reviewer corrections alter the agent's browser
+     *  exploration (not just plan.inputs). Optional for back-compat
+     *  with pre-hotfix callers. */
+    priorObservations?: string[],
   ) => Promise<DryRunOutput>;
 }
 
@@ -338,7 +377,13 @@ export async function runBlock1(
     let dryRun: DryRunOutput | null = null;
     if (!plan.requiresContext && plan.actions.length > 0) {
       dryRun = await wrapStepFrames(bus, runId, "dry_run", () =>
-        deps.runDryRun(plan, opts.abortSignal),
+        // week2d Part 2 hotfix-1 — forward per-pass observations
+        // to dry_run's ReAct loop. `observations` is the controller's
+        // local accumulator (seeded from opts.seedObservations +
+        // appended to each pass's exit-reason). This is what lets
+        // reviewer corrections (from refine/backtrack seed) alter
+        // dry_run's exploration, not just plan.inputs.
+        deps.runDryRun(plan, opts.abortSignal, [...observations]),
       );
     }
 

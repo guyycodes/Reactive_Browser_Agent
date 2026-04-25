@@ -203,7 +203,7 @@ Rules of thumb for beginners:
 
 
 ================================================================================
- 3. THE 9-STEP WORKFLOW (the backbone)
+ 3. THE 10-STEP WORKFLOW (the backbone)
 ================================================================================
 
 This is the sequential chain of work the agent performs for every ticket.
@@ -243,19 +243,34 @@ N+1). Humans interact at TWO places (the double-bordered gate boxes).
               ╚════════════════════════════════════╝
                                    │  (on approve)
                                    ▼
+                      ┌────────────────────────────┐
+                      │ materializeSkillCardStep   │
+                      │  (week2d Part 3b)          │
+                      │  actionTrace + boundary    │
+                      │  → ephemeral Skill         │
+                      │  → ctx.tempSkillCard       │
+                      │  → Postgres row            │
+                      │    <host>_<scaffold>_<uuid>│
+                      │  See §12 SCAFFOLD vs       │
+                      │  ARTIFACT primitive.       │
+                      └────────────────────────────┘
+                                   │
+                                   ▼
                       ┌────────────────────────┐
                       │ executeStep            │
-                      │  (Playwright — drives  │
-                      │   the destructive      │
-                      │   browser flow)        │
+                      │  (walks                │
+                      │   ctx.tempSkillCard    │
+                      │   via skill-card       │
+                      │   executor)            │
                       └────────────────────────┘
                                    │
                                    ▼
                       ┌────────────────────────┐
                       │ verifyStep             │
-                      │  (Sonnet — reads       │
-                      │   post-exec state,     │
-                      │   emits success bool)  │
+                      │  (week2d Part 3c —     │
+                      │   structured JSON over │
+                      │   postconditions; hard-│
+                      │   fail on stepsRun=0)  │
                       └────────────────────────┘
                                    │
                                    ▼
@@ -284,13 +299,24 @@ N+1). Humans interact at TWO places (the double-bordered gate boxes).
 
 Where to find each step's code:
   block1Step             → src/mastra/workflows/triage.ts  (wraps runBlock1)
-  classify/retrieve/plan/dry_run  → same file (bodies named `runXxxStep`;
+  classify/retrieve/plan → same file (bodies named `runXxxStep`;
                             blockController invokes them directly)
+  dry_run (agentic ReAct)→ same file (`runDryRunStep` — week2d Part 2;
+                            delegates to runReActIterations over
+                            `buildBrowserReactTools()`)
   reviewGateStep         → same file  (`runReviewGateStep` — also hosts the
                             pre-exec refine loop)
-  executeStep            → same file  (`runExecuteStep`)
-  verifyStep             → same file  (`runVerifyStep`)
-  humanVerifyGateStep    → same file  (hosts the post-exec backtrack loop)
+  materializeSkillCardStep→same file  (`runMaterializeSkillCardStep` —
+                            week2d Part 3b; also invoked from
+                            humanVerifyGateStep's backtrack loop)
+  executeStep            → same file  (`runExecuteStep` — post-week2d
+                            reads `ctx.tempSkillCard`; baseUrl from
+                            materialize output per week2e)
+  verifyStep             → same file  (`runVerifyStep` — week2d Part 3c
+                            redesign; structured JSON over postconditions)
+  humanVerifyGateStep    → same file  (hosts the post-exec backtrack loop;
+                            week2d Part 3b inserts materialize invocation
+                            between runReviewGateStep + runExecuteStep)
   logAndNotifyStep       → same file
 
 
@@ -849,7 +875,12 @@ PRIMITIVES LAYER
              return observationsPrefix(ctx?.priorObservations) +
                     `Ticket: ${ctx?.ticket?.subject}`;
            },
-           parseFinal: (text) => { ... },  // parse JSON, return { category, ... }
+           produceOutput: (iterations, input) => {  // polish #19 fix
+             const finalIter = iterations.find((it) => it.final)
+                             ?? iterations[iterations.length - 1];
+             const parsed = tryParseJson(finalIter?.thought ?? "");
+             return { category: parsed?.category ?? "uncategorized", ... };
+           },
          });
   2. That's it. The existing envelope frames (react.iteration.*) already
      render in the UI. No frontend changes needed.
@@ -1110,6 +1141,234 @@ Not blockers — just "here's where you'd look" when the time comes.
      `status=ok` on the WS stream might still have stepsRun=0 + Jane's
      row unchanged. Smoke acceptance requires querying Postgres or the
      actual target system. (See STARTUP_PROCESS §1.6.7.)
+
+================================================================================
+12. CONCEPTUAL PRIMITIVE — SKILL CARDS: SCAFFOLD vs ARTIFACT (week2d)
+================================================================================
+
+Read this alongside §5 (ReAct), §11 (invariants), and `runContext.ts`'s
+CTX SPREAD INVARIANT — this is a same-class primitive.
+
+THE REFRAMING
+-------------
+Pre-week2d: skill cards at `kb/skill_cards/<app>/<skill>.yml` were
+RUNTIME WALKERS. `runDryRunStep` + `runExecuteStep` both called
+`executeSkillCardSteps(loadSkill(plan.skillCardIds[0]))` to walk the
+YAML-declared action sequence against the live browser.
+
+Post-week2d: skill cards are SCAFFOLDS. Agent's actual trace is the
+ARTIFACT. Divergence between them is the auditability signal.
+
+  ┌──────────────────────────────┬──────────────────────────────┐
+  │ SCAFFOLD                     │ ARTIFACT                     │
+  │ (pre-authored, versioned)    │ (ephemeral, per-run)         │
+  ├──────────────────────────────┼──────────────────────────────┤
+  │ kb/skill_cards/<app>/*.yml   │ ctx.tempSkillCard (in-memory)│
+  │                              │ + materialized_skills row    │
+  │                              │ + step.completed frame       │
+  │                              │                              │
+  │ Authored by humans           │ Written once by              │
+  │                              │ runMaterializeSkillCardStep  │
+  │                              │                              │
+  │ Read by plan (selection)     │ Read by runExecuteStep       │
+  │                              │      runVerifyStep           │
+  │                              │                              │
+  │ Authoritative for:           │ Authoritative for:           │
+  │  - intent shape              │  - what was ACTUALLY done    │
+  │  - destructive boundaries    │  - deterministic execute walk│
+  │  - declared inputs           │  - postcondition evaluation  │
+  │  - postconditions            │    basis                     │
+  │                              │                              │
+  │ Example:                     │ Example:                     │
+  │  reset_password.yml →        │  reset_password_materialized │
+  │   steps[] + destructive:true │   steps: [... actionTrace ...│
+  │   on "Reset password button" │   + appended click on        │
+  │                              │     boundaryReached.element] │
+  └──────────────────────────────┴──────────────────────────────┘
+
+THE FLOW
+--------
+   1. plan selects scaffold (by skillCardIds[]) + emits plan.inputs
+        + optionally plan.targetUrl (week2e)
+   2. dry_run: agentic ReAct exploration using
+        `buildBrowserReactTools()`. Agent sees scaffold as HINT (via
+        formatScaffoldHint) but is free to adapt to today's UI.
+        Stops at `boundary_reached` (see §5 REACT_FINAL_SENTINEL).
+   3. review_gate: reviewer sees actionTrace + boundaryReached +
+        divergence banner (if scaffoldMatch=false).
+   4. materialize (on approve): scaffold-inherited postconditions +
+        actionTrace (with verbatim-input substitution) + appended
+        destructive click (from boundaryReached.element) →
+        ephemeral Skill → ctx.tempSkillCard + Postgres row with
+        name `<host>_<scaffold>_<uuid4>`.
+   5. execute: `executeSkillCardSteps(ctx.tempSkillCard, ...)` with
+        resumeAtFirstDestructive:true (session-reuse path from
+        dry_run; destructive-append is the appended last step).
+   6. verify: structured LLM-judge on tempSkillCard.postconditions
+        vs fresh snapshot → {success, evidence[]} with specific
+        DOM-ref citations.
+
+CRITICAL MENTAL MODEL — THE DESTRUCTIVE-APPEND
+----------------------------------------------
+`boundary_reached` fires BEFORE the destructive click. Therefore
+`DryRunSchema.actionTrace` contains ONLY non-destructive pre-
+destructive steps. The destructive action exists ONLY as metadata
+in `boundaryReached.element` / `.reason`. The materializer APPENDS
+a synthesized click step marked `destructive:true` as the final step
+of the ephemeral skill. A naive 1-to-1 mapping would produce a zero-
+destructive-step skill — `executeSkillCardSteps(resumeAtFirstDestructive:
+true)` would no-op on it.
+
+See `materializeSteps()` in `triage.ts` for the implementation.
+Regression guard: `materializeSkillCard.test.ts [1]`.
+
+DIVERGENCE
+----------
+When `boundaryReached.scaffoldMatch === false`, the materializer
+populates `MaterializeSchema.divergence: { expected, actual, reason }`:
+- `expected`: scaffold's declared destructive element name
+- `actual`: agent's observed element name
+- `reason`: agent's explanation
+
+Reviewer UI (Part 4) renders:
+- LEFT column: warn-yellow chip on the materialize_skill_card row
+- RIGHT feed: full-width warn banner with expected/actual/reason
+
+Divergence is signal, not error — it's legitimate UI drift and the
+reviewer decides whether the agent's observed action is semantically
+equivalent to the scaffold's declared one.
+
+WHAT STAYS FROM WEEK2B
+----------------------
+- Skill-card schema (`src/schemas/skill-card.ts`) — unchanged; temp
+  cards conform to the same Zod schema.
+- `loadSkill` + `loadAllSkills` — used by plan for scaffold selection.
+- `executeSkillCardSteps(... preflight: false)` — used by execute to
+  walk the temp card.
+- `kb/skill_cards/test-webapp/*.yml` — become scaffolds; still
+  validated by `validate:skill-cards`, still embedded to RAG by
+  `embed:skill-cards`.
+
+WHAT CHANGED IN WEEK2D
+----------------------
+- `executeSkillCardSteps(... preflight: true)` in `runDryRunStep` —
+  removed. Replaced by ReAct loop over `buildBrowserReactTools()`.
+- `runDryRunStep` body — rewritten as `runReActIterations(...)`.
+- `runVerifyStep` body — rewritten as structured comparison (no ReAct,
+  no `/verified/i` regex).
+- New step `materialize_skill_card` between `review_gate` (approve)
+  and `executeStep`.
+- New field `RunContext.tempSkillCard?: Skill`.
+- New fields on `PlanSchema`: `inputs`, `targetUrl`.
+- New fields on `DryRunSchema`: `actionTrace[]`, `boundaryReached`.
+- New envelope stepId: `materialize_skill_card`.
+- New table: `materialized_skills` (Postgres, migration 0003).
+
+
+================================================================================
+13. CONCEPTUAL PRIMITIVE — REVIEWER-CONTROL VIA EDIT-REFINE (week2d/2e)
+================================================================================
+
+The product's pitch: "reviewer steers the agent via Edit at the gate."
+This primitive codifies the mechanism so every layer treats it
+consistently.
+
+THE PATTERN
+-----------
+  reviewer's Edit note (patch.notes)
+     │
+     ▼
+  runReviewGateStep refine loop wraps note as seedObservation:
+     "Pre-exec refine N: reviewer note: <note>"
+     │
+     ▼
+  runBlock1(input, deps, { seedObservations: [...] })
+     │  controller seeds its `observations` accumulator on entry
+     ▼
+  inner cognitive spread (classify/retrieve/plan) reads
+     priorObservations via ambient ctx — observations flow into
+     each LLM call's user message via `observationsPrefix(obs)`
+     │
+     ▼
+  runDryRunStep reads priorObservations via its deps param
+     (Part 2 hotfix-1 — threaded explicitly because dry_run runs
+     OUTSIDE the cognitive spread per CTX SPREAD INVARIANT)
+     │
+     ▼
+  AGENT ADAPTS: Sonnet in classify/retrieve/plan reshapes
+     classification, retrieval queries, plan.inputs, plan.targetUrl,
+     plan.skillCardIds based on reviewer guidance. ReAct dry_run
+     agent reshapes browser exploration (different fillForm values,
+     different search terms, different navigation).
+
+AUDITABILITY REQUIREMENT — Path A+
+----------------------------------
+Implicit behavior shifts (dry_run just navigates somewhere different)
+are NOT sufficient for the audit story. Corrections must produce
+DISCRETE, VISIBLE FIELD DELTAS in the event log.
+
+Pattern: plan's system prompt INSTRUCTS Sonnet to re-emit corrected
+values as first-class plan output fields when observations contain
+corrections. Examples:
+
+  Correction         → plan field that must flip       → Reference
+  ─────────────────    ─────────────────────────────    ──────────────
+  Target user         plan.inputs.email                 week2d Part 3
+  Operator creds      (agent-level via ReAct)           week2d hotfix-2
+  Element name        (boundaryReached.element)         week2d Part 4
+                      + reviewer approves divergence
+  Target URL          plan.targetUrl                    week2e Path A+
+  Skill selection     plan.skillCardIds[0]              future
+  (future)
+
+The plan prompt contains explicit blocks ("TARGET URL RESOLUTION",
+"INPUTS EXTRACTION") telling Sonnet "if prior observations contain
+a correction of type X, adopt it authoritatively and emit as field
+Y." Without these blocks, Sonnet might adopt the correction
+implicitly (via its own tool choices) but the audit log wouldn't
+show a discrete before/after.
+
+LIVE-VERIFIED AXES
+------------------
+These three reviewer-correction types have been live-smoked end-to-end:
+
+  1. Target user flip (jane → leo) via inputs
+     - Smoke runId: `153b7084-f7bc-4c8f-a477-596af6a985df`
+     - Mechanism: seedObservations → plan.inputs re-extracted
+
+  2. Operator creds flip (theo → sam) via dry_run adoption
+     - Same smoke (combined with user flip)
+     - Mechanism: seedObservations → Sonnet's dry_run ReAct
+       reshapes fillForm values in browser exploration
+
+  3. Target URL flip (planetfitness.com → test-webapp:3000)
+     - Smoke runId: `6f630744-4785-46b9-b1e5-b689b49bcfaa`
+     - Cross-ORIGIN flip, not just path correction
+     - Mechanism: seedObservations → Sonnet re-emits
+       plan.targetUrl per Path A+ prompt instruction
+     - Evolution in event log:
+         pass 0: https://planetfitness.com (ticket)
+         pass 1: https://planetfitness.com (Block 1 retry)
+         pass 2: https://planetfitness.com (Block 1 retry)
+         refined: http://test-webapp:3000 (post-Edit)
+
+BUDGETS
+-------
+Refine loop is capped at `MAX_PRE_GATE_REFINES = 2` (3 total review
+cycles per gate). Post-exec reject triggers `MAX_BACKTRACKS = 2`
+backtrack cycles. Budget-exhaustion flows through the skip-cascade
+to `status: rejected` (NOT `status: failed`) per week2a Finding 2.
+
+WHEN NOT TO USE EDIT
+--------------------
+- Block 1 exhausted (`blockResult.passedLast === false`): Edit hides
+  in the UI because same upstream cause retriggers the refine budget.
+  Reviewer picks Reject (replan with directive) or Terminate.
+- Post-exec gate: Edit hidden in the UI; `humanVerifyGateStep` treats
+  edit ≡ approve server-side. "Approve + note" semantic is polish #11.
+- Hopelessly lost: Terminate is the escape. MAX budgets cap refine
+  iteration cost; reviewer shouldn't indefinitely retry.
+
 
 ================================================================================
  END

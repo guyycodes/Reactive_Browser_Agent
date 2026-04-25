@@ -47,6 +47,35 @@ export const events = pgTable(
   }),
 );
 
+/** week2d Part 3b — Persistent audit trail for materialized skills.
+ *  Each happy-path run produces one row after successful materialization.
+ *  `id` is a UUID4 that ALSO serves as the Qdrant collection name when
+ *  vector-DB ingestion lands (embedding work deferred per reviewer).
+ *  `name` follows the convention `<host>_<scaffold>_<uuid>`, unique
+ *  across the table so operators can grep by domain or scaffold. */
+export const materializedSkills = pgTable(
+  "materialized_skills",
+  {
+    id: uuid("id").primaryKey(),
+    name: text("name").notNull(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "cascade" }),
+    scaffoldName: text("scaffold_name").notNull(),
+    baseUrl: text("base_url").notNull(),
+    skillJson: jsonb("skill_json").notNull(),
+    divergence: jsonb("divergence"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => ({
+    nameUnique: unique("materialized_skills_name_unique").on(t.name),
+    byRunIdx: index("materialized_skills_run_id_idx").on(t.runId),
+    byScaffoldIdx: index("materialized_skills_scaffold_name_idx").on(t.scaffoldName),
+  }),
+);
+
 export const reviews = pgTable(
   "reviews",
   {

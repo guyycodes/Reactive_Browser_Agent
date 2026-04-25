@@ -68,6 +68,9 @@ The **engine** (generic) is invariant. The **chain** (what steps in what order) 
 | `src/mastra/lib/blockController.ts` (`runBlock1`) | ✅ | Retry-with-accumulated-observations pattern; generic over "which steps go inside the block" |
 | `src/mastra/runContext.ts` + CTX SPREAD INVARIANT | ✅ | AsyncLocalStorage wrapper; the invariant docblock itself is load-bearing |
 | `src/mastra/stepEmitter.ts` | ✅ | Generic Mastra-events → envelope-frames translator |
+| `REACT_FINAL_SENTINEL` sentinel mechanism (reactRunner.ts) | ✅ | week2d Part 1 — name-agnostic early-termination primitive. Any future ReactTool can opt in via runtime cast; runner detects + strips + breaks loop. Domain-neutral. |
+| SCAFFOLD vs ARTIFACT conceptual primitive (Architecture.txt §12) | ✅ | week2d Part 0 — reframes pre-authored skill cards as intent-shape hints vs ephemeral agent-traced artifacts. Domain-neutral: any domain with a "pre-authored recipe vs actually-performed sequence" split inherits the pattern. |
+| REVIEWER-CONTROL VIA EDIT-REFINE primitive (Architecture.txt §13) | ✅ | week2d/2e — codifies Edit-note → seedObservations → auditable plan-field flips (inputs, targetUrl, ...). Discrete field-delta audit trail is domain-neutral; only the specific fields populated are variant-specific. |
 
 ### 3.3 Entry layer — mostly invariant
 
@@ -107,7 +110,7 @@ Condensed table; see §5 for the narrative per variant.
 | Tool layer — retrieval | `rag.ts` → runbook + skill-card collections | domain-specific RAG wrapper | domain-specific RAG wrapper (may be empty) | code-aware RAG (tree-sitter, symbol graph, git blame) |
 | Tool layer — action | `playwrightMcp.ts` → browser driving | domain's workspace manipulator | text-only; `action` is "the agent's proposed label" | `filesystem.ts` + `lsp.ts` + `shell.ts` |
 | Tool layer — verification | Playwright snapshot + Sonnet verify | domain snapshot + verify | structured-output validator | test runner + typechecker + linter |
-| Skill cards | IT skills (reset_password, unlock_account) | domain capability cards | optional; dataset-shape cards possible | edit primitives (refactor, add_test, rename_symbol) |
+| Skill cards (SCAFFOLDS post-week2d — see Architecture.txt §12) | IT skills (reset_password, unlock_account) | domain capability cards | optional; dataset-shape cards possible | edit primitives (refactor, add_test, rename_symbol) |
 | External: target | `test-webapp` (BPO admin portal stand-in) | domain's target system | none or text-only | real repo / worktree / LSP server / shell |
 | Primitives | unchanged | unchanged | unchanged + export hooks | unchanged |
 | Verbage | ticket / reset / unlock / runbook / skill card / reviewer | task / operation / plan / action / reviewer | rollout / trajectory / preference / chosen / rejected / annotator | task / instruction / diff / patch / edit / reviewer |

@@ -69,6 +69,36 @@ import { getRunContext, withRunContext } from "../runContext.js";
  *     transient Anthropic 500s retry automatically per iteration.
  */
 
+/** Opt-in sentinel a tool's `invoke` can include in its return value to
+ *  signal "this was the last iteration needed." The runner records the
+ *  tool call as a normal observation (frames emit identically), then
+ *  breaks the iteration loop after invoke returns. The sentinel is
+ *  STRIPPED before the output is stored on
+ *  `ReactIteration.toolCall.output`, so downstream `produceOutput`
+ *  consumers see their declared `TOutput` shape clean — no cascading
+ *  awareness of the termination mechanism.
+ *
+ *  Name-agnostic by design: the runner never branches on `tool.name` to
+ *  decide termination. Concrete first consumer is `boundary_reached`
+ *  (week2d Part 1, `reactBrowserTools.ts`). Future candidates: a
+ *  `user_intent_clarified` tool on a clarification-gate step; a
+ *  `goal_reached` tool on a verify-style ReAct step.
+ *
+ *  USAGE CONVENTION: tools that want to terminate the loop should
+ *  return their `TOutput` with `REACT_FINAL_SENTINEL` set to `true`,
+ *  using a runtime cast (`as unknown as TOutput`). The declared type
+ *  is intentionally NOT widened on `ReactTool.invoke`'s return because
+ *  TS variance on the tool registry (`Record<string, ReactTool>`)
+ *  causes fixture-assignment friction with the existing
+ *  `ReactTool<TypedInput, TypedOutput>` fixtures. Runtime behavior:
+ *  runner detects the sentinel, strips it before storing on
+ *  `iter.toolCall.output`, and breaks the iteration loop.
+ *
+ *  Canonical first consumer: `boundary_reached` in
+ *  `reactBrowserTools.ts` (see `BoundaryReachedOutput` + the invoke
+ *  return's `as unknown as BoundaryReachedOutput` pattern). */
+export const REACT_FINAL_SENTINEL = "__final" as const;
+
 export interface ReactInvokeCtx {
   /** Optional — tools should forward this to their own AbortSignal
    *  plumbing if they want to honor external cancellation. A step
@@ -102,7 +132,18 @@ export interface ReactTool<TInput = unknown, TOutput = unknown> {
   /** Actual tool implementation. Should emit its own `tool.*` span
    *  frames via the ambient `getRunContext().bus` (the runner has
    *  already replaced that bus with a reactIterationId-tagging Proxy
-   *  via `withRunContext` by the time `invoke` runs). */
+   *  via `withRunContext` by the time `invoke` runs).
+   *
+   *  Early-termination opt-in: a tool may attach
+   *  `{ [REACT_FINAL_SENTINEL]: true }` to its return value (via a
+   *  type-assertion cast — the sentinel is intentionally OUTSIDE the
+   *  declared TOutput so every existing tool's type-inference story
+   *  stays unchanged). The runner runtime-detects the sentinel,
+   *  strips it from the stored output, flips the iteration's `final`
+   *  field to true, and breaks the loop after the normal frame
+   *  emission completes. See `REACT_FINAL_SENTINEL` + the canonical
+   *  reference implementation at `reactBrowserTools.ts`
+   *  `boundary_reached`. */
   invoke: (input: TInput, ctx: ReactInvokeCtx) => Promise<TOutput>;
   /** Shape the observation summary that goes back into the next
    *  iteration's user message. Default: `JSON.stringify(output).slice(0, 400)`. */
@@ -130,8 +171,15 @@ export interface ReactIteration {
 
 export interface CreateReActStepArgs<TInput, TOutput> {
   id: StepId;
-  inputSchema: z.ZodType<TInput>;
-  outputSchema: z.ZodType<TOutput>;
+  /** week2d Part 2 widening — accepts preprocessed schemas (e.g.
+   *  `PlanSchema` has `z.preprocess(null → undefined)` on `actions[].value`
+   *  + `missingContext`) whose input type differs from output type. The
+   *  default `z.ZodType<T>` equals `z.ZodType<T, ZodTypeDef, T>` which
+   *  rejects preprocess-widened inputs. Using `any` on the input-side
+   *  parameter lets Zod do runtime coercion before the runner sees
+   *  `TInput`; `parseAsync` is the guard at dispatch time. */
+  inputSchema: z.ZodType<TInput, z.ZodTypeDef, unknown>;
+  outputSchema: z.ZodType<TOutput, z.ZodTypeDef, unknown>;
   tier: ClaudeTier;
   thinkingEnabled?: boolean;
   /** Hard cap on iteration count. Default 3. Envelope additionally
@@ -388,7 +436,7 @@ export async function runReActIterations<TInput, TOutput>(
         // `tool.*` / `rag.retrieved` / etc. emissions inherit
         // `reactIterationId`.
         try {
-          const output = await withRunContext(
+          const raw = await withRunContext(
             { ...ctx, bus: taggedBus },
             () =>
               tool.invoke(parsed.data, {
@@ -398,6 +446,22 @@ export async function runReActIterations<TInput, TOutput>(
                 reactIterationId,
               }),
           );
+          // week2d Part 1 — detect + strip the REACT_FINAL_SENTINEL.
+          // Non-object outputs (unusual but permitted by the TOutput
+          // generic) pass through untouched. Strip runs regardless of
+          // whether the sentinel is present so the hot path stays
+          // single-branch.
+          const isFinal =
+            typeof raw === "object" &&
+            raw !== null &&
+            (raw as Record<string, unknown>)[REACT_FINAL_SENTINEL] === true;
+          const output: unknown = isFinal
+            ? (() => {
+                const clone = { ...(raw as Record<string, unknown>) };
+                delete clone[REACT_FINAL_SENTINEL];
+                return clone;
+              })()
+            : raw;
           const summary = tool.summarize
             ? tool.summarize(output)
             : JSON.stringify(output).slice(0, 400);
@@ -412,7 +476,7 @@ export async function runReActIterations<TInput, TOutput>(
             reactIterationId,
             thought: streamResult.text,
             toolCall: { name: toolUse.name, input: parsed.data, output },
-            final: false,
+            final: isFinal,
           };
           iterations.push(iter);
           bus.publish({
@@ -422,11 +486,18 @@ export async function runReActIterations<TInput, TOutput>(
               type: "react.iteration.completed",
               reactRunId,
               iteration: i,
+              // Frame-level `final` tracks "LLM emitted end_turn" — a
+              // sentinel-terminated iteration is not that; the iteration
+              // DID call a tool. The runner-level loop termination is
+              // separate (see iter.final above + the break below). This
+              // observability asymmetry is tracked as MASTER_PLAN polish
+              // queue #24.
               final: false,
               toolUsed: toolUse.name,
               observationSummary: summary.slice(0, 400) || undefined,
             },
           });
+          if (isFinal) break;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           observationLog.push({

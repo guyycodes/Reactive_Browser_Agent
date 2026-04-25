@@ -11,11 +11,11 @@ A **platform-pivotable substrate for human-in-the-loop agents**, populated as a 
 Most agent frameworks optimize for autonomy. This one is built around the opposite bet: **human-gated destructive action is the product**. The engineering trade-offs follow from there.
 
 - **Two-gate HIL workflow with a 4-decision model.** Reviewers see the agent's proposed plan before any destructive action runs, and the post-execution result before the run is closed. At each gate, the reviewer can `approve`, `reject` (replan without notes), `edit` (replan with notes), or `terminate` (full-stop). All four decisions are wired end-to-end through Zod-validated envelope frames, a per-stepId decision bus, and a Postgres audit log.
-- **Platform-pivot architecture.** The orchestration engine, event bus, circuit breaker, and reviewer UI are vertical-agnostic substrate. The IT-helpdesk specifics (Playwright MCP, runbooks, skill cards) live in a swappable tool layer. A **[`PLATFORM_PIVOT_POINT` git tag](https://github.com/guyycodes/Reactive_Browser_Agent/releases/tag/PLATFORM_PIVOT_POINT)** freezes the substrate baseline; `git checkout PLATFORM_PIVOT_POINT` returns to a revert point for any future pivot. See [`docs/PLATFORM_PIVOTS.md`](./docs/PLATFORM_PIVOTS.md) for the layer-swap map across four candidate verticals.
+- **Platform-pivot architecture.** The orchestration engine, event bus, circuit breaker, and reviewer UI are vertical-agnostic substrate. The IT-helpdesk specifics (Playwright MCP, runbooks, skill cards) live in a swappable tool layer. A `**[PLATFORM_PIVOT_POINT` git tag](https://github.com/guyycodes/Reactive_Browser_Agent/releases/tag/PLATFORM_PIVOT_POINT)** freezes the substrate baseline; `git checkout PLATFORM_PIVOT_POINT` returns to a revert point for any future pivot. See `[docs/PLATFORM_PIVOTS.md](./docs/PLATFORM_PIVOTS.md)` for the layer-swap map across four candidate verticals.
 - **Frames are the single source of truth.** Every agent-internal event (LLM thinking deltas, tool calls, browser screenshots, human decisions) emits a Zod-validated envelope frame with a monotonic sequence number. The reviewer UI, the Postgres audit log, and any future replay/eval harness all read the same frame stream. No side channels, no observability debt.
-- **Streaming ReAct reasoning.** Cognitive steps (`classify`, `retrieve`, `plan`, `verify`) use a reusable `createReActStep` runner that emits nested `react.iteration.*` frames, letting the reviewer watch the agent think → call a tool → observe → refine in real time.
+- **Streaming ReAct reasoning.** Cognitive steps (`classify`, `retrieve`, `plan`, `verify`) use a reusable `createReActStep` runner that emits nested `react.iteration.`* frames, letting the reviewer watch the agent think → call a tool → observe → refine in real time.
 - **Circuit-breaker hardened LLM calls.** Every Anthropic streaming call routes through a three-state breaker (closed → open → half-open) with exponential backoff and single-probe recovery. Transient 5xx storms no longer kill runs.
-- **Retroactive forensic audit trail.** Four documented bug fingerprints can be queried against the append-only Postgres `events` table at any time. Each bug's SQL signature, affected runs, and causal narrative lives in [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md).
+- **Retroactive forensic audit trail.** Four documented bug fingerprints can be queried against the append-only Postgres `events` table at any time. Each bug's SQL signature, affected runs, and causal narrative lives in `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)`.
 
 ---
 
@@ -30,7 +30,7 @@ Most agent frameworks optimize for autonomy. This one is built around the opposi
 - ⏳ Week 2b — skill-card schema + RAG wiring to replace hardcoded IT flows
 - ⏳ Week 2c — apply `createReActStep` to `classify` and `verify`
 
-See [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md) for the full progress table, forensic bug audit, and Week-2 polish queue.
+See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)` for the full progress table, forensic bug audit, and Week-2 polish queue.
 
 ---
 
@@ -57,35 +57,41 @@ See [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md) for the full progress table, 
 
 For the full architectural documentation:
 
-| Doc | Purpose |
-|---|---|
-| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Repo-level topology, service contracts, reviewer UI information architecture |
-| [`docs/Architecture.txt`](./docs/Architecture.txt) | Agent-code visual (layer cake + workflow + ReAct + meta-loops), beginner-friendly |
-| [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md) | Roadmap, commit-by-commit progress, forensic audit trail, polish queue |
-| [`docs/PLATFORM_PIVOTS.md`](./docs/PLATFORM_PIVOTS.md) | Layer-swap map for pivoting to other verticals (training tool, coding tool, generic HITL editor) |
-| [`docs/STARTUP_PROCESS.md`](./docs/STARTUP_PROCESS.md) | Boot + smoke + forensic acceptance guards |
+
+| Doc                                                    | Purpose                                                                                          |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)`       | Repo-level topology, service contracts, reviewer UI information architecture                     |
+| `[docs/Architecture.txt](./docs/Architecture.txt)`     | Agent-code visual (layer cake + workflow + ReAct + meta-loops), beginner-friendly                |
+| `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)`         | Roadmap, commit-by-commit progress, forensic audit trail, polish queue                           |
+| `[docs/PLATFORM_PIVOTS.md](./docs/PLATFORM_PIVOTS.md)` | Layer-swap map for pivoting to other verticals (training tool, coding tool, generic HITL editor) |
+| `[docs/STARTUP_PROCESS.md](./docs/STARTUP_PROCESS.md)` | Boot + smoke + forensic acceptance guards                                                        |
+
 
 ---
 
 ## Services (on `agent-net`)
 
-| Service | Role | Host port(s) | Internal DNS |
-|---|---|---|---|
-| `agent` | Mastra workflows + Playwright MCP + HTTP/WS | `3001`, `9229` | `agent` |
-| `test-webapp` | Reviewer UI + Playwright target | `3000` | `test-webapp` |
-| `rag` | FastAPI embedder (e5-large-v2, 1024-dim) | `3009` | `rag` |
-| `qdrant` | Vector DB | `6333`, `6334` | `qdrant` |
-| `postgres` | Events + reviews + runs | `5432` | `postgres` |
-| `browser-viewer` | noVNC bridge (parked) | `6080` | `browser-viewer` |
+
+| Service          | Role                                        | Host port(s)   | Internal DNS     |
+| ---------------- | ------------------------------------------- | -------------- | ---------------- |
+| `agent`          | Mastra workflows + Playwright MCP + HTTP/WS | `3001`, `9229` | `agent`          |
+| `test-webapp`    | Reviewer UI + Playwright target             | `3000`         | `test-webapp`    |
+| `rag`            | FastAPI embedder (e5-large-v2, 1024-dim)    | `3009`         | `rag`            |
+| `qdrant`         | Vector DB                                   | `6333`, `6334` | `qdrant`         |
+| `postgres`       | Events + reviews + runs                     | `5432`         | `postgres`       |
+| `browser-viewer` | noVNC bridge (parked)                       | `6080`         | `browser-viewer` |
+
 
 A `services-healthcheck` aggregator gates on `qdrant + postgres + rag` so tooling / CI has a single readiness signal.
 
 ---
 
 ### Pivot point tag
+
 The `PLATFORM_PIVOT_POINT` tag is a snapshot of the IT-helpdesk substrate baseline. It's the commit that contains the IT-tool tool-layer and chain-bodies populated as the canonical reference implementation.
 
 ## env variables
+
 ```bash
 # Local overrides — gitignored. Mirror `.env.example` structure; keep values real.
 
@@ -122,6 +128,7 @@ HF_TOKEN=
 ```
 
 ## Clone the repo
+
 ```bash
 # Fork first (via GitHub UI), then clone their fork
 git clone git@github.com:<their-username>/Reactive_Browser_Agent.git their-pivot
@@ -148,7 +155,7 @@ docker compose ps                   # 7 services should be healthy
 # Run the agent test suite (157 tests)
 docker exec agent bash -lc 'cd /workspace/services/agent && npm run check'
 
-# Kick a smoke run
+# Kick a ticket in for a smoke run
 curl -sS -X POST http://localhost:3001/triage \
   -H 'content-type: application/json' \
   -d '{"ticketId":"T-demo","subject":"Reset password for jane@example.com"}'
@@ -172,11 +179,11 @@ Or use the dev container: **Reopen in Container** → VS Code attaches to `agent
 
 ## Action items outstanding
 
-- [ ] **Rotate the Hugging Face token** previously committed to `.env.example` as a literal value. The token is scrubbed in the file now but sat on disk in cleartext — revoke on HF Settings → Access Tokens before the repo is pushed publicly.
-- [ ] Week 2b + 2c development continues on top of `PLATFORM_PIVOT_POINT`. See [`docs/MASTER_PLAN.md`](./docs/MASTER_PLAN.md).
+- **Rotate the Hugging Face token** previously committed to `.env.example` as a literal value. The token is scrubbed in the file now but sat on disk in cleartext — revoke on HF Settings → Access Tokens before the repo is pushed publicly.
+- Week 2b + 2c development continues on top of `PLATFORM_PIVOT_POINT`. See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)`.
 
 ---
 
 ## License
 
-See [`LICENSE`](./LICENSE).
+See `[LICENSE](./LICENSE)`.

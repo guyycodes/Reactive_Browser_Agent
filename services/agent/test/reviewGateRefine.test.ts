@@ -65,6 +65,9 @@ const FAKE_DRY_RUN = {
   domMatches: true,
   anomalies: [],
   plan: FAKE_PLAN,
+  // week2d Part 2 — required DryRunSchema fields.
+  actionTrace: [],
+  boundaryReached: null,
 };
 
 /** Block1Result fixture returned by the stub on each refine
@@ -91,6 +94,9 @@ const HAPPY_BLOCK1_RESULT: Block1Result = {
       domMatches: true,
       anomalies: [],
       plan: FAKE_PLAN,
+      // week2d Part 2 — optional on blockController.DryRunOutput.
+      actionTrace: [],
+      boundaryReached: null,
     },
   },
   carriedObservations: [],

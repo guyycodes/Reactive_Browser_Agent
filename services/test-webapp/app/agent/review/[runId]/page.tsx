@@ -33,6 +33,10 @@ const STEP_IDS = [
   "plan",
   "dry_run",
   "review_gate",
+  // week2d Part 4 — 10-step workflow. Inserted between review_gate
+  // (approve) and execute. Renders LEFT-column <StepOutcome> row
+  // with materialized skill convention name + divergence chip.
+  "materialize_skill_card",
   "execute",
   "verify",
   "log_and_notify",
@@ -147,6 +151,9 @@ const STEP_LABELS: Record<StepId, string> = {
   human_verify_gate: "human_verify_gate",
   log_and_notify: "log_and_notify",
   block1: "block 1",
+  // week2d Part 4 — snake_case matches the other multi-word step
+  // ids for SQL + smoke-recipe consistency.
+  materialize_skill_card: "materialize",
 };
 
 export default function ReviewPage() {
@@ -586,6 +593,7 @@ function StepOutcome(props: {
       case "retrieve":       return renderRetrieveBody(output);
       case "plan":           return renderPlanBody(output);
       case "dry_run":        return renderDryRunBody(output);
+      case "materialize_skill_card": return renderMaterializeBody(output);
       case "execute":        return renderExecuteBody(output);
       case "verify":         return renderVerifyBody(output);
       case "log_and_notify": return renderLogBody(output);
@@ -683,6 +691,61 @@ function renderPlanBody(o: Record<string, unknown>): React.ReactNode {
         {actions}-step plan{destructive ? " · ⚠ destructive" : ""}
       </span>
       {planText && <PlanPreview text={planText} />}
+    </>
+  );
+}
+
+/** week2d Part 4 — materialize_skill_card LEFT-column row.
+ *
+ *  Skill JSON shape (from MaterializeSchema in triage.ts):
+ *    { skill: { name, steps[], ... },
+ *      skillId: UUID,
+ *      skillName: "<host>_<scaffold>_<uuid>",
+ *      divergence: { expected, actual, reason } | null,
+ *      ... }
+ *
+ *  Three visual states:
+ *    - skipped sentinel (skill.name === "skipped") → dim one-liner
+ *    - happy (divergence === null) → step count + truncated skillName
+ *    - divergent (divergence !== null) → same + warn-yellow chip
+ *      that's a button expanding to show expected/actual/reason. */
+function renderMaterializeBody(o: Record<string, unknown>): React.ReactNode {
+  const skill = (o.skill ?? {}) as Record<string, unknown>;
+  const skillNameCard = String(skill.name ?? "");
+  const convention = String(o.skillName ?? "");
+  const steps = Array.isArray(skill.steps) ? (skill.steps as unknown[]) : [];
+  const divergence = (o.divergence ?? null) as
+    | { expected?: string; actual?: string; reason?: string }
+    | null;
+
+  // Skip-cascade sentinel — see MINIMAL_SKIPPED_SKILL in triage.ts.
+  if (skillNameCard === "skipped") {
+    return <span className="dim">(skipped — reviewer rejected/terminated)</span>;
+  }
+
+  const shortName = convention.length > 40
+    ? `${convention.slice(0, 37)}…`
+    : convention;
+
+  return (
+    <>
+      <span>
+        {steps.length} step{steps.length === 1 ? "" : "s"} · {skillNameCard || "—"}
+      </span>
+      {convention && (
+        <div className="dim cell-mono" title={convention}>
+          {shortName}
+        </div>
+      )}
+      {divergence && (
+        <div
+          className="materialize-divergence-chip"
+          data-testid="materialize-divergence-chip"
+          title={`expected: ${divergence.expected ?? "—"} · actual: ${divergence.actual ?? "—"} · ${divergence.reason ?? ""}`}
+        >
+          ⚠ divergence: {short(String(divergence.actual ?? ""), 48)}
+        </div>
+      )}
     </>
   );
 }
@@ -841,6 +904,26 @@ type FeedBacktrackBanner = {
   iterationId?: string;
 };
 
+/** week2d Part 4 — divergence banner inserted in the feed at the
+ *  chronological position of a materialize_skill_card.step.completed
+ *  frame whose output.divergence !== null. Warn-yellow accent, full
+ *  width, read-only. Complementary to the LEFT-column chip in
+ *  renderMaterializeBody — this surface carries the detail, LEFT
+ *  carries the status signal. */
+type FeedDivergenceBanner = {
+  kind: "divergence";
+  key: string;
+  stepId: StepId;
+  expected: string;
+  actual: string;
+  reason: string;
+  skillName?: string;
+  /** Structural feed items (dividers, banners) don't nest under
+   *  ReAct iterations — optional to satisfy FeedItemView's
+   *  iteration-wrap prop shape. */
+  iterationId?: string;
+};
+
 type FeedItem =
   | { kind: "divider"; key: string; stepId: StepId; phase: "start" | "complete" | "failed"; durationMs?: number; errorMsg?: string; iterationId?: string }
   | FeedBubble
@@ -848,6 +931,7 @@ type FeedItem =
   | FeedIterationDivider
   | FeedBlockDivider
   | FeedBacktrackBanner
+  | FeedDivergenceBanner
   | { kind: "rag"; key: string; stepId: StepId; frame: Frame; iterationId?: string }
   | { kind: "nav"; key: string; stepId: StepId; frame: Frame; iterationId?: string }
   | { kind: "screenshot"; key: string; stepId: StepId; frame: Frame; iterationId?: string }
@@ -902,6 +986,28 @@ function projectFeedItems(frames: Frame[]): FeedItem[] {
           phase: "complete",
           durationMs: Number(f.durationMs ?? 0),
         });
+        // week2d Part 4 — divergence banner insertion.
+        // Fires when materialize_skill_card's step.completed carries
+        // a non-null divergence (scaffoldMatch was false; UI drift).
+        // Happy-path materializations (divergence === null) emit zero
+        // banners — identical to pre-Part-4 behavior.
+        if (f.stepId === "materialize_skill_card") {
+          const out = f.output as
+            | { divergence?: { expected?: unknown; actual?: unknown; reason?: unknown } | null; skillName?: unknown }
+            | undefined;
+          const div = out?.divergence;
+          if (div && typeof div === "object") {
+            items.push({
+              kind: "divergence",
+              key: keyOf(f, "-div"),
+              stepId: f.stepId,
+              expected: String(div.expected ?? "—"),
+              actual: String(div.actual ?? "—"),
+              reason: String(div.reason ?? ""),
+              skillName: typeof out?.skillName === "string" ? out.skillName : undefined,
+            });
+          }
+        }
         break;
       case "step.failed": {
         const err = f.error as { message?: string } | undefined;
@@ -1204,6 +1310,8 @@ function renderInner(item: FeedItem, runId: string) {
       return <FeedBlockDividerView item={item} />;
     case "backtrack":
       return <FeedBacktrackBannerView item={item} />;
+    case "divergence":
+      return <FeedDivergenceBannerView item={item} />;
     case "bubble":
       return <FeedBubbleView item={item} />;
     case "tool":
@@ -1328,6 +1436,48 @@ function FeedBacktrackBannerView({
           {otherEntries.length === 1 ? "" : "s"} forward
         </div>
       )}
+    </div>
+  );
+}
+
+/** week2d Part 4 — divergence banner. Inline full-width row in the
+ *  behavior feed, rendered at the chronological position of a
+ *  materialize_skill_card.step.completed frame whose output.divergence
+ *  !== null. Warn-yellow accent, read-only. Complementary to the
+ *  LEFT-column chip in renderMaterializeBody: LEFT carries the
+ *  status signal, RIGHT carries the detail (expected / actual / reason). */
+function FeedDivergenceBannerView({
+  item,
+}: {
+  item: Extract<FeedItem, { kind: "divergence" }>;
+}) {
+  return (
+    <div
+      className="feed-divergence-banner"
+      data-testid="feed-divergence-banner"
+    >
+      <div className="feed-divergence-head">
+        <span className="feed-divergence-icon">⚠</span>
+        <span className="feed-divergence-title">UI DRIFT DETECTED</span>
+      </div>
+      <div className="feed-divergence-row">
+        <span className="feed-divergence-label">Scaffold expected:</span>
+        <span className="feed-divergence-value">{item.expected}</span>
+      </div>
+      <div className="feed-divergence-row">
+        <span className="feed-divergence-label">Agent found:</span>
+        <span className="feed-divergence-value">{item.actual}</span>
+      </div>
+      {item.reason && (
+        <div className="feed-divergence-reason">
+          <span className="feed-divergence-label">Reason:</span>{" "}
+          <span className="feed-divergence-value">&ldquo;{item.reason}&rdquo;</span>
+        </div>
+      )}
+      <div className="feed-divergence-footer dim">
+        The materialized skill uses the agent&apos;s observed element. Reviewer:
+        verify the semantic match at the gate above.
+      </div>
     </div>
   );
 }
@@ -1720,7 +1870,28 @@ function ChatBar(props: {
   // Sub-state derivations (match today's ReviewPanel exactly).
   const isPostExec = props.pendingReview?.reviewHint === "post_exec";
   const blockResult = props.pendingReview?.blockResult;
-  const isExhausted = blockResult?.passedLast === false;
+  const isBlock1Exhausted = blockResult?.passedLast === false;
+
+  // week2d Part 4 — dry_run-exhaustion derivation. The review.requested
+  // frame doesn't surface boundaryReached directly (envelope non-goal
+  // for Part 4), so scan the frames array backwards for the most-recent
+  // dry_run step.completed and read its output.boundaryReached. `null`
+  // = agent exhausted iteration cap without identifying a destructive
+  // boundary (Part 3 RFC §6 graceful-exhaustion path). Only relevant
+  // on pre-exec gate (post-exec wouldn't have a live dry_run output).
+  const isDryRunExhausted = useMemo(() => {
+    if (!props.pendingReview || isPostExec) return false;
+    for (let i = props.frames.length - 1; i >= 0; i--) {
+      const f = props.frames[i]!;
+      if (f.type === "step.completed" && f.stepId === "dry_run") {
+        const out = f.output as { boundaryReached?: unknown } | undefined;
+        return out?.boundaryReached === null || out?.boundaryReached === undefined;
+      }
+    }
+    return false;
+  }, [props.frames, props.pendingReview, isPostExec]);
+
+  const isExhausted = isBlock1Exhausted || isDryRunExhausted;
 
   // Mode derivation (priority order).
   type ChatBarMode = "idle" | "decision-required" | "submitting" | "terminal";
@@ -1766,10 +1937,16 @@ function ChatBar(props: {
   //   submitting state forever since no fresh review.requested
   //   follows a post-exec edit. DO NOT re-enable here without also
   //   changing the server semantic. Polish item #11 queued.)
-  //   Exhausted also hides Edit because Block 1 already spent its
-  //   3-pass budget — a reviewer note would trip the refine budget
+  //   Block-1-exhausted also hides Edit because Block 1 already spent
+  //   its 3-pass budget — a reviewer note would trip the refine budget
   //   with the same upstream cause.
-  const allowEdit = mode === "decision-required" && !isPostExec && !isExhausted;
+  //   week2d Part 4 — dry_run-exhaustion DOES allow Edit, specifically
+  //   so the reviewer can provide a UI-drift hint to help the next
+  //   exploration find the destructive boundary. Distinct from Block-1
+  //   exhaustion because the failure mode is a tight iteration budget,
+  //   not a deeper plan problem.
+  const allowEdit =
+    mode === "decision-required" && !isPostExec && !isBlock1Exhausted;
 
   const trimmedLength = note.trim().length;
   const canSubmitEdit =
@@ -1870,10 +2047,17 @@ function ChatBar(props: {
     }
     if (mode === "decision-required") {
       if (isExhausted) {
-        const passes = blockResult?.passes ?? 0;
-        return `⚠ Block 1 exhausted — ${passes} pass${
-          passes === 1 ? "" : "es"
-        } failed. Reject to terminate; override-and-proceed is Week-2 polish.`;
+        if (isBlock1Exhausted) {
+          const passes = blockResult?.passes ?? 0;
+          return `⚠ Block 1 exhausted — ${passes} pass${
+            passes === 1 ? "" : "es"
+          } failed. Reject to replan; terminate to stop; override-and-proceed is Week-2 polish.`;
+        }
+        // week2d Part 4 — dry_run-exhaustion distinct copy. Agent
+        // spent its iteration budget without flagging a destructive
+        // boundary; reviewer can Edit with a UI-drift hint to help
+        // the next exploration, Reject to auto-retry, or Terminate.
+        return `⚠ Dry-run exhausted its iteration budget without identifying a destructive boundary. The agent explored but couldn't confidently flag the commit action. Edit with a UI-drift hint, Reject to retry, or Terminate.`;
       }
       if (isPostExec) {
         return `Post-execution review. Reject triggers a backtrack through Block 1 (max ${MAX_BACKTRACKS_UI} retries per run).`;

@@ -4,9 +4,11 @@ import { randomUUID } from "node:crypto";
 import { streamMessage } from "../../llm/streamMapper.js";
 import { getRunContext, tryGetRunContext, withRunContext } from "../runContext.js";
 import { logger } from "../../logger.js";
+import type { StepId } from "../../events/envelope.js";
 import {
   retrieveRunbooks,
   retrieveSkills,
+  retrieveCategoryHints,
   RagClientError,
   RagSchemaError,
   type RagHit,
@@ -15,6 +17,7 @@ import {
   launchBrowser,
   type BrowserSession,
 } from "../tools/playwrightMcp.js";
+import { buildBrowserReactTools } from "../tools/reactBrowserTools.js";
 import {
   createReActStep,
   runReActIterations,
@@ -41,8 +44,12 @@ import {
   SkillCardNotFoundError,
   type LoadedSkill,
 } from "../../lib/skillCardLoader.js";
-import type { Skill, SkillCard } from "../../schemas/skill-card.js";
+import { SkillSchema, type Skill, type SkillCard, type SkillInput } from "../../schemas/skill-card.js";
 import type { TemplateContext } from "../../lib/templateEngine.js";
+import {
+  buildMaterializedSkillName,
+  insertMaterializedSkill,
+} from "../../db/materializedSkills.js";
 // Re-export the ref helpers so test/findRef.test.ts' existing imports
 // from this module keep working without an import-path churn.
 export { findRefByAccessibleName, findRefForRole };
@@ -199,6 +206,31 @@ const PlanSchema = z.object({
     (v) => (v === null ? undefined : v),
     z.array(z.string().max(200)).max(8).optional(),
   ),
+  /** week2d Part 3 — template-substitution values extracted by the
+   *  planner from the ticket. Populated by Part 3's plan-prompt
+   *  update (3b); until then, soft-defaults to `{}`. Consumed by
+   *  `runMaterializeSkillCardStep` to rewrite verbatim-match literals
+   *  in the actionTrace args to `{{ inputs.X }}` placeholders on the
+   *  ephemeral skill.
+   *
+   *  `.default({})` keeps back-compat during 3a (schema lands but plan
+   *  parser doesn't yet populate). Parse soft-fallback: malformed
+   *  inputs → `{}` + log.warn (see `planOutputParser`, 3b). */
+  inputs: z.record(z.string()).default({}),
+  /** week2e-dynamic-target-url — target URL override.
+   *
+   *  Resolution precedence (Path A+):
+   *    1. Reviewer correction in seedObservations (e.g. "the correct
+   *       URL is X") → plan prompt instructs Sonnet to re-emit here.
+   *    2. `ctx.ticket.targetUrl` from `/triage` intake body.
+   *    3. Scaffold's `base_url` (fallback at dry_run + materialize).
+   *
+   *  Making the corrected URL a discrete plan-output field (rather
+   *  than implicit in Sonnet's navigation choices) gives reviewers +
+   *  operators a visible, audit-logged "URL flipped from A → B at
+   *  refine pass N" signal on `step.completed.output.targetUrl`.
+   *  Optional — absent when the scaffold's default is authoritative. */
+  targetUrl: z.string().url().optional(),
 });
 
 /** 7b.iii.a — reason codes recorded per Block 1 pass. Mirrors the
@@ -223,6 +255,42 @@ const BlockResultSchema = z.object({
   allReasons: z.array(Block1ReasonSchema).max(10),
 });
 
+/** week2d Part 2 — one browser action the dry_run agent actually
+ *  performed. Populated from the iteration trace's `toolCall` on every
+ *  non-`boundary_reached` iteration. `destructive` is never true in
+ *  Part 2 (dry_run never clicks the destructive element by design —
+ *  `boundary_reached` guards that); Part 3's materializer flips it
+ *  true on the last action before the boundary signal. `screenshotPath`
+ *  is reserved for a future widening where the iteration walker
+ *  recovers the implicit 7a.iv screenshot path; Part 2 leaves it
+ *  unpopulated (DOM excerpt in the runner's observation carries the
+ *  state signal). */
+const DryRunActionSchema = z.object({
+  tool: z.enum([
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_fillForm",
+    "browser_takeScreenshot",
+  ]),
+  args: z.record(z.unknown()),
+  destructive: z.boolean().optional(),
+  screenshotPath: z.string().optional(),
+});
+
+/** week2d Part 2 — the boundary signal the dry_run agent emits via
+ *  `boundary_reached`. `scaffoldMatch` is nullable: true = matches
+ *  scaffold's declared destructive step verbatim; false = UI drift,
+ *  agent found a differently-named-but-same-intent element;
+ *  null = agent omitted the field (Part 1 validator allows optional).
+ *  Reviewer UI branches on this in Part 4. */
+const BoundaryReachedSchema = z.object({
+  element: z.string().min(1).max(200),
+  reason: z.string().min(1).max(500),
+  scaffoldMatch: z.boolean().nullable(),
+  iteration: z.number().int().nonnegative(),
+});
+
 const DryRunSchema = z.object({
   domMatches: z.boolean(),
   anomalies: z.array(z.string()),
@@ -230,7 +298,24 @@ const DryRunSchema = z.object({
   /** 7b.iii.a — set only when this output came from an exhausted
    *  Block 1 pass. Absence is the happy-path signal. */
   blockResult: BlockResultSchema.optional(),
+  /** week2d Part 2 — sequence of browser ops the dry_run agent
+   *  actually performed. Populated on every DryRunSchema-emitting
+   *  path (required field, never omitted — use `[]` when no trace). */
+  actionTrace: z.array(DryRunActionSchema),
+  /** week2d Part 2 — the destructive-boundary signal. `null` on
+   *  exhaustion paths or when Block 1 refused before dry_run ran. */
+  boundaryReached: BoundaryReachedSchema.nullable(),
 });
+
+/** week2d Part 3 — divergence between scaffold's declared destructive
+ *  step and the agent's observed destructive element. Non-null only
+ *  when `boundaryReached.scaffoldMatch === false` (UI drift). */
+const DivergenceSchema = z.object({
+  expected: z.string().min(1).max(200),
+  actual: z.string().min(1).max(200),
+  reason: z.string().min(1).max(500),
+});
+
 
 const ReviewSchema = z.object({
   // Week-2a gate-decision-model — 4-value enum matches envelope.ts
@@ -244,6 +329,42 @@ const ReviewSchema = z.object({
   approved: z.boolean(),
   dryRun: DryRunSchema,
 });
+
+/** week2d Part 3 — output of `runMaterializeSkillCardStep` (Mastra step).
+ *  `skill` is the ephemeral materialized card (conforms to existing
+ *  `SkillSchema`). `baseUrl` is forwarded from the scaffold so
+ *  `runExecuteStep` doesn't need to re-load (resolution of §11 #1).
+ *  `divergence` surfaces the scaffold-vs-actual destructive element
+ *  mismatch. `dryRun` carries forward for audit. `review` is threaded
+ *  from `reviewGateStep` so `runExecuteStep` can still detect the
+ *  skip-cascade path via `review.approved === false`.
+ *
+ *  week2d Part 3b — `skillId` (UUID4) and `skillName` (convention
+ *  identifier `<host>_<scaffold>_<uuid>`) are produced by the
+ *  materializer and persisted to `materialized_skills`. `skillId`
+ *  doubles as the Qdrant collection UUID for future vector-DB
+ *  ingestion (embedding work deferred per reviewer). */
+const MaterializeSchema = z.object({
+  skill: SkillSchema,
+  skillId: z.string().uuid(),
+  skillName: z.string().min(1).max(256),
+  baseUrl: z.string().url(),
+  divergence: DivergenceSchema.nullable(),
+  dryRun: DryRunSchema,
+  review: ReviewSchema,
+});
+
+/** week2d Part 3 — placeholder skill for the skip-cascade path (when
+ *  reviewGateStep returns `approved: false`). Materialize's Mastra
+ *  wrapper emits this so MaterializeSchema stays required-shape;
+ *  `runExecuteStep` short-circuits on `review.approved === false`
+ *  before reading the skill. Valid per SkillSchema. */
+const MINIMAL_SKIPPED_SKILL: Skill = {
+  name: "skipped",
+  description: "Placeholder for skipped execution (review rejected/terminated).",
+  destructive: false,
+  steps: [{ tool: "snapshot", args: {}, destructive: false }],
+};
 
 const ExecuteSchema = z.object({
   stepsRun: z.number().int().nonnegative(),
@@ -281,69 +402,204 @@ function observationsPrefix(obs: string[] | undefined): string {
   );
 }
 
-/** 7b.iii.a — extracted classify body so the Block 1 controller can
- *  invoke it directly (outside Mastra's step-execution machinery).
- *  `classifyStep` is a thin wrapper; the controller calls this
- *  function and emits its own `step.started` / `step.completed` frames
- *  around the invocation. Same pattern as `runPlanStep` / `runDryRunStep`. */
-export async function runClassifyStep(
-  inputData: z.infer<typeof TicketSchema>,
-): Promise<z.infer<typeof ClassificationSchema>> {
-  const { runId, bus, priorObservations } = getRunContext();
+// Commit week2c-react-classify — classifyStep reframed as a ReAct loop.
+//
+// Before: one-shot Haiku call returned ClassificationSchema JSON
+// directly. No adaptation to the ticket content, no way for the
+// classifier to consult the skill-card knowledge base when uncertain
+// about the category, no visibility into the reasoning.
+//
+// After: a `createReActStep` instance with one tool —
+// `rag_retrieveCategoryHints` — that biases skill-card retrieval
+// toward a category guess (composed query `"Category: <cat>. <q>"`
+// routes to SHARED_SKILLS_UUID). The model can call the tool ONCE when
+// uncertain about the category, then finalize. Simpler than
+// retrieveStep's two-tool shape (one tool, not a sequence), lower
+// iteration budget (maxIterations=2), lower tier (haiku preserved —
+// classify is a one-tool decision and Haiku handles it trivially).
+//
+// Output shape unchanged — ClassificationSchema. Downstream retrieveStep
+// / planStep see identical input. Fallback-on-malformed-JSON behavior
+// from the pre-ReAct implementation is preserved inside produceOutput.
+//
+// Envelope: no changes. The runner's `react.iteration.*` frames plus
+// `reactIterationId` tagging of every inner frame already render in
+// the reviewer UI (proven by retrieveStep's 7b.ii smoke). Tool-call
+// path emits the business-level `rag.retrieveCategoryHints` dotted-
+// form `tool.started` → `rag.retrieved` → `tool.completed` span via
+// `runRagCall`, continuous with classify pre-ReAct observability.
+//
+// LLM calls inside each iteration ride `getCircuit("anthropic")` —
+// transient Anthropic 500s retry automatically per iteration.
+//
+// Block1Deps.runClassify signature preserved: `(input) =>
+// Promise<ClassificationOutput>`. The thin wrapper below forwards to
+// `runReActIterations(input, undefined, classifyStepConfig)`; the
+// Mastra step wrapper uses `createReActStep<TIn, TOut>(...)` which
+// threads abortSignal through automatically.
 
-  const system =
-    "You classify IT helpdesk tickets. Return ONLY a JSON object with keys: " +
-    '`category` (string), `urgency` (one of "low"|"medium"|"high"), ' +
-    "`targetApps` (array of app names referenced by the ticket, possibly empty), " +
-    "`confidence` (float 0..1). No prose outside the JSON.";
+const CategoryHintsInputSchema = z.object({
+  category: z.string().min(1).max(64),
+  query: z.string().min(1).max(500),
+});
 
-  const userMsg =
-    observationsPrefix(priorObservations) +
-    `Ticket ID: ${inputData.ticketId}\n` +
-    `Subject: ${inputData.subject}\n` +
-    (inputData.submittedBy ? `Submitted by: ${inputData.submittedBy}\n` : "");
+/** Anthropic `input_schema` shape (hand-written JSON Schema). Paired
+ *  with `CategoryHintsInputSchema` for runtime validation. Same
+ *  zod-to-json-schema deferral rationale as retrieveStep's
+ *  `RAG_QUERY_INPUT_JSON_SCHEMA` — worth picking up a helper once
+ *  tool count passes ~5. */
+const CATEGORY_HINTS_INPUT_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    category: {
+      type: "string",
+      description:
+        "Your current best-guess category for this ticket (e.g. 'account_management', 'access_request'). The retrieval will be biased toward skill cards matching this category.",
+    },
+    query: {
+      type: "string",
+      description:
+        "A focused query about what skill-card content to retrieve (e.g. 'password reset locked user'). Prefer short, specific phrases.",
+    },
+  },
+  required: ["category", "query"],
+  additionalProperties: false,
+} as const;
 
-  const result = await streamMessage({
-    runId,
-    bus,
-    stepId: "classify",
-    tier: "haiku",
-    maxTokens: 512,
-    thinkingEnabled: false,
-    system,
-    messages: [{ role: "user", content: userMsg }],
-  });
-
-  // Parse; if the model drifts off-format, fall back to a low-confidence
-  // default so the workflow keeps moving and the downstream step can
-  // observe the confidence score.
-  const parsed = tryParseJson<Record<string, unknown>>(result.text);
-  const validated = ClassificationSchema.safeParse({
-    category: String(parsed?.category ?? "uncategorized"),
-    urgency: pickUrgency(parsed?.urgency),
-    targetApps: Array.isArray(parsed?.targetApps)
-      ? parsed.targetApps.map(String)
-      : [],
-    confidence: typeof parsed?.confidence === "number" ? parsed.confidence : 0.3,
-  });
-  if (!validated.success) {
-    logger.warn({ issues: validated.error.issues }, "[classify] fallback defaults");
-    return {
-      category: "uncategorized",
-      urgency: "low" as const,
-      targetApps: [],
-      confidence: 0.3,
-    };
-  }
-  return validated.data;
-}
-
-const classifyStep = createStep({
-  id: "classify",
+/** week2c-react-classify — extracted classify config. Same typing
+ *  rationale as `retrieveStepConfig`: explicit
+ *  `CreateReActStepArgs<TIn, TOut>` typing restores callback inference
+ *  that would be lost if we inlined the config directly into
+ *  `createReActStep<TIn, TOut>({...})`. */
+const classifyStepConfig: CreateReActStepArgs<
+  z.infer<typeof TicketSchema>,
+  z.infer<typeof ClassificationSchema>
+> = {
+  id: "classify" as const,
   inputSchema: TicketSchema,
   outputSchema: ClassificationSchema,
-  execute: ({ inputData }) => runClassifyStep(inputData),
-});
+  tier: "haiku" as const,
+  thinkingEnabled: false,
+  maxIterations: 2,
+  tools: {
+    rag_retrieveCategoryHints: {
+      // Anthropic tool-name regex (no dots) — see retrieveStep's note.
+      // Business-level `tool.started` frame still uses the dotted form
+      // `rag.retrieveCategoryHints` for continuity.
+      name: "rag_retrieveCategoryHints",
+      description:
+        "Search the skill-cards knowledge base for cards matching a suspected ticket category. Use this to confirm or refine your category guess before finalizing classification. Returns hit scores, source paths, and short previews.",
+      inputSchema: CATEGORY_HINTS_INPUT_JSON_SCHEMA as unknown as Record<string, unknown>,
+      validator: CategoryHintsInputSchema,
+      invoke: async (input: unknown, ctx) => {
+        const { category, query } = input as { category: string; query: string };
+        return runRagCall({
+          name: "rag.retrieveCategoryHints",
+          stepId: ctx.stepId,
+          collection: env("SHARED_SKILLS_UUID"),
+          query,
+          abortSignal: ctx.signal ?? new AbortController().signal,
+          invoke: (signal) => retrieveCategoryHints(category, query, { signal }),
+        });
+      },
+      // Lever A (week2c-react-claude-verbosity) — content-bearing
+      // summary so Sonnet's next iteration has real evidence to cite
+      // instead of speculating. Top-3 hits, 80-char previews to stay
+      // under the 400-char frame-side slice. Noun "category-hint".
+      summarize: (output: unknown) => {
+        const { hitCount, hits } = output as {
+          hitCount: number;
+          hits: Array<{ score: number; source: string; preview: string }>;
+        };
+        if (hitCount === 0) return "0 category-hints";
+        const top = hits
+          .slice(0, 3)
+          .map(
+            (h) =>
+              `  ${h.score.toFixed(2)} ${h.source.split("/").pop() ?? h.source} — ${h.preview.slice(0, 80).replace(/\s+/g, " ")}…`,
+          )
+          .join("\n");
+        return `${hitCount} category-hint${hitCount === 1 ? "" : "s"}:\n${top}`;
+      },
+    },
+  },
+  // Lever B (week2c-react-claude-verbosity) — terse action-verb form
+  // with hard output constraints + explicit no-preamble clause.
+  // Haiku tends to wrap JSON in ```json fences even when told "JSON
+  // only", so the fence-ban is called out explicitly.
+  buildSystem: () =>
+    "Classify IT helpdesk tickets. Call `rag_retrieveCategoryHints` ONCE if category is unclear; otherwise finalize immediately. " +
+    'Output: JSON with keys `category` (string), `urgency` ("low"|"medium"|"high"), `targetApps` (string[]), `confidence` (0..1). ' +
+    "No preamble. No narration. No markdown fences. Respond with ONLY the JSON object.",
+  // Same pattern + rationale as retrieveStep's buildUserMessage (see
+  // comment above that callback at triage.ts:482-490): called from
+  // inside `runReActIterations` under a `withRunContext({ ...ctx,
+  // bus: taggedBus })` scope, so `getRunContext()` sees accumulated
+  // `priorObservations`. `tryGetRunContext` null-safe so any future
+  // direct-test of this callback outside a run-context scope degrades
+  // gracefully to the pass-0 behavior.
+  buildUserMessage: (input: z.infer<typeof TicketSchema>) => {
+    const ctx = tryGetRunContext();
+    return (
+      observationsPrefix(ctx?.priorObservations) +
+      `Ticket ID: ${input.ticketId}\n` +
+      `Subject: ${input.subject}\n` +
+      (input.submittedBy ? `Submitted by: ${input.submittedBy}\n` : "")
+    );
+  },
+  produceOutput: (iterations, _input) => {
+    // Final iteration is the last one with `final: true`. If the
+    // iteration cap exhausted without an explicit final, fall back to
+    // the last iteration's `thought` — still contains whatever JSON
+    // the model was producing. This mirrors the pre-ReAct fallback-
+    // defaults behavior: we never propagate a hard failure up; the
+    // workflow keeps moving and downstream steps observe the
+    // confidence score.
+    const finalIter =
+      iterations.find((it) => it.final) ?? iterations[iterations.length - 1];
+    const rawText = finalIter?.thought ?? "";
+    const parsed = tryParseJson<Record<string, unknown>>(rawText);
+    const validated = ClassificationSchema.safeParse({
+      category: String(parsed?.category ?? "uncategorized"),
+      urgency: pickUrgency(parsed?.urgency),
+      targetApps: Array.isArray(parsed?.targetApps)
+        ? parsed.targetApps.map(String)
+        : [],
+      confidence: typeof parsed?.confidence === "number" ? parsed.confidence : 0.3,
+    });
+    if (!validated.success) {
+      logger.warn(
+        { issues: validated.error.issues },
+        "[classify] fallback defaults",
+      );
+      return {
+        category: "uncategorized",
+        urgency: "low" as const,
+        targetApps: [],
+        confidence: 0.3,
+      };
+    }
+    return validated.data;
+  },
+};
+
+const classifyStep = createReActStep<
+  z.infer<typeof TicketSchema>,
+  z.infer<typeof ClassificationSchema>
+>(classifyStepConfig);
+
+/** Extracted classify body so the Block 1 controller can invoke it
+ *  directly (outside Mastra's step-execution machinery). Thin wrapper
+ *  around `runReActIterations` — same pattern as `runRetrieveStep`'s
+ *  relationship to `retrieveStepConfig`. `abortSignal` is optional so
+ *  `Block1Deps.runClassify` (signature: `(input) => Promise<...>`)
+ *  continues to type-check without modification. */
+export async function runClassifyStep(
+  inputData: z.infer<typeof TicketSchema>,
+  abortSignal?: AbortSignal,
+): Promise<z.infer<typeof ClassificationSchema>> {
+  return runReActIterations(inputData, abortSignal, classifyStepConfig);
+}
 
 // Commit 7b.ii — retrieveStep reframed as a ReAct loop.
 //
@@ -416,7 +672,15 @@ const retrieveStepConfig: CreateReActStepArgs<
   outputSchema: RetrievalSchema,
   tier: "sonnet" as const,
   thinkingEnabled: false, // retrieve isn't reasoning-heavy; save tokens + latency
-  maxIterations: 3,
+  // Lever D (week2c-react-claude-verbosity) — cap at 2 iterations
+  // (runbooks + skills), not 3. The 3rd iteration's final-text was
+  // dead weight: `produceOutput` aggregates from toolCall outputs
+  // only (ignores iter.toolCall === null), so the model's narrative
+  // summary was never read. Removes ~10s latency per run + verbose
+  // commentary from the RIGHT-column feed. Paired with the "both
+  // tool calls required" clause in buildSystem below so the cap
+  // reliably enforces termination after both RAG calls.
+  maxIterations: 2,
   // Tool `invoke` + `summarize` are typed against `unknown` here — the
   // `ToolRegistry = Record<string, ReactTool>` shape widens the generic
   // parameters when tools are inlined. Runtime validation still applies:
@@ -439,15 +703,29 @@ const retrieveStepConfig: CreateReActStepArgs<
         const { query } = input as { query: string };
         return runRagCall({
           name: "rag.retrieveRunbooks",
+          stepId: ctx.stepId,
           collection: env("SHARED_RUNBOOKS_UUID"),
           query,
           abortSignal: ctx.signal ?? new AbortController().signal,
           invoke: (signal) => retrieveRunbooks(query, { signal }),
         });
       },
+      // Lever A (week2c-react-claude-verbosity) — content-bearing
+      // summary. Same shape as rag_retrieveCategoryHints above.
       summarize: (output: unknown) => {
-        const { hitCount } = output as { hitCount: number };
-        return `${hitCount} runbook hit${hitCount === 1 ? "" : "s"}`;
+        const { hitCount, hits } = output as {
+          hitCount: number;
+          hits: Array<{ score: number; source: string; preview: string }>;
+        };
+        if (hitCount === 0) return "0 runbook hits";
+        const top = hits
+          .slice(0, 3)
+          .map(
+            (h) =>
+              `  ${h.score.toFixed(2)} ${h.source.split("/").pop() ?? h.source} — ${h.preview.slice(0, 80).replace(/\s+/g, " ")}…`,
+          )
+          .join("\n");
+        return `${hitCount} runbook hit${hitCount === 1 ? "" : "s"}:\n${top}`;
       },
     },
     rag_retrieveSkills: {
@@ -460,25 +738,47 @@ const retrieveStepConfig: CreateReActStepArgs<
         const { query } = input as { query: string };
         return runRagCall({
           name: "rag.retrieveSkills",
+          stepId: ctx.stepId,
           collection: env("SHARED_SKILLS_UUID"),
           query,
           abortSignal: ctx.signal ?? new AbortController().signal,
           invoke: (signal) => retrieveSkills(query, { signal }),
         });
       },
+      // Lever A (week2c-react-claude-verbosity) — content-bearing
+      // summary. Same shape as rag_retrieveCategoryHints / Runbooks.
       summarize: (output: unknown) => {
-        const { hitCount } = output as { hitCount: number };
-        return `${hitCount} skill-card hit${hitCount === 1 ? "" : "s"}`;
+        const { hitCount, hits } = output as {
+          hitCount: number;
+          hits: Array<{ score: number; source: string; preview: string }>;
+        };
+        if (hitCount === 0) return "0 skill-card hits";
+        const top = hits
+          .slice(0, 3)
+          .map(
+            (h) =>
+              `  ${h.score.toFixed(2)} ${h.source.split("/").pop() ?? h.source} — ${h.preview.slice(0, 80).replace(/\s+/g, " ")}…`,
+          )
+          .join("\n");
+        return `${hitCount} skill-card hit${hitCount === 1 ? "" : "s"}:\n${top}`;
       },
     },
   },
+  // Lever B (week2c-react-claude-verbosity) + Lever D — terse form
+  // with "both tool calls required" clause. Under Lever D
+  // (maxIterations=2), the cap enforces termination after runbooks +
+  // skills — no final-text iteration exists. The "do not terminate
+  // early" clause prevents Sonnet from emitting final text at iter 1
+  // instead of the second tool call (the edge case the ≤25-word
+  // budget was originally guarding against — reframing to prohibit
+  // the edge case entirely is cleaner).
   buildSystem: (c: z.infer<typeof ClassificationSchema>) =>
-    `You help a tier-1 IT helpdesk agent retrieve relevant runbooks and skill cards from the knowledge base. ` +
-    `The ticket has been classified as category="${c.category}", urgency="${c.urgency}"` +
+    `Retrieve relevant runbooks and skill cards for this classified ticket ` +
+    `(category="${c.category}", urgency="${c.urgency}"` +
     (c.targetApps.length > 0 ? `, targetApps=${c.targetApps.join(", ")}` : "") +
-    `. Your job is to decide what to query the knowledge base for and observe the results. ` +
-    `If hit scores are weak (top score below 0.5) you may refine your query and retry. ` +
-    `When you have enough evidence (or a couple of queries have not improved the results), respond with a short final text summary — no further tool calls.`,
+    `). Call \`rag_retrieveRunbooks\`, then call \`rag_retrieveSkills\`. Both tool ` +
+    `calls are required — do not terminate early. Refine ONCE if a top score ` +
+    `is below 0.5. No preamble. No narration about iterations. No meta-commentary.`,
   // 7b.iii.a — buildUserMessage is called from inside `runReActIterations`
   // which runs inside a `withRunContext({ ...ctx, bus: taggedBus })`
   // scope (verified at reactRunner.ts:266-267). The spread preserves
@@ -564,7 +864,18 @@ function buildRetrievalQuery(c: z.infer<typeof ClassificationSchema>): string {
  *  (a retry-heavy call surfaces as a slow `tool.completed` in the reviewer UI —
  *  intentional: slow retrieves are diagnostic signal, not noise to hide). */
 async function runRagCall(args: {
-  name: "rag.retrieveRunbooks" | "rag.retrieveSkills";
+  name:
+    | "rag.retrieveRunbooks"
+    | "rag.retrieveSkills"
+    | "rag.retrieveCategoryHints";
+  // hotfix-1 — threaded from the ReactTool's `ctx.stepId` at the call
+  // site (`reactRunner.ts ReactInvokeCtx.stepId`). Pre-hotfix this was
+  // hardcoded to "retrieve" at every publish site, which mis-attributed
+  // classify's `rag_retrieveCategoryHints` frames to `stepId=retrieve`
+  // in the events table. UI nesting via reactIterationId was unaffected
+  // (it reads the runner's own dividers), but step-level `GROUP BY
+  // step_id` queries returned wrong results.
+  stepId: StepId;
   collection: string;
   query: string;
   abortSignal: AbortSignal;
@@ -576,7 +887,7 @@ async function runRagCall(args: {
 
   bus.publish({
     runId,
-    stepId: "retrieve",
+    stepId: args.stepId,
     payload: {
       type: "tool.started",
       invocationId,
@@ -591,7 +902,7 @@ async function runRagCall(args: {
 
     bus.publish({
       runId,
-      stepId: "retrieve",
+      stepId: args.stepId,
       payload: {
         type: "rag.retrieved",
         collection: args.collection,
@@ -602,7 +913,7 @@ async function runRagCall(args: {
 
     bus.publish({
       runId,
-      stepId: "retrieve",
+      stepId: args.stepId,
       payload: {
         type: "tool.completed",
         invocationId,
@@ -635,7 +946,7 @@ async function runRagCall(args: {
 
     bus.publish({
       runId,
-      stepId: "retrieve",
+      stepId: args.stepId,
       payload: {
         type: "tool.failed",
         invocationId,
@@ -849,8 +1160,39 @@ export async function runPlanStep(
       "  }],\n" +
       '  "destructive": boolean,                   // true iff any action is destructive (overridden by skill-card destructive flag when skillCardName is set)\n' +
       '  "requiresContext": boolean,\n' +
-      '  "missingContext": string[]?               // required if requiresContext=true\n' +
+      '  "missingContext": string[]?,              // required if requiresContext=true\n' +
+      '  "inputs": { [inputName: string]: string }, // template-substitution values extracted from the ticket (see INPUTS EXTRACTION below)\n' +
+      '  "targetUrl": string | null               // optional URL override (see TARGET URL RESOLUTION below)\n' +
       "}\n" +
+      "\n" +
+      "INPUTS EXTRACTION (week2d Part 3):\n" +
+      "\n" +
+      "If you selected a skillCardName, emit `inputs` with the ticket-derived values that map to that skill card's declared inputs. The materializer uses these values to rewrite verbatim literals in the dry_run's browser action args to `{{ inputs.<key> }}` placeholders, making the materialized skill portable across inputs.\n" +
+      "\n" +
+      "Rules:\n" +
+      "- Emit ONLY values explicitly present in the ticket subject or body. Do NOT invent values.\n" +
+      "- On ambiguity: first-match-wins (whatever candidate appears first in the ticket text).\n" +
+      "- If a required scaffold input is ABSENT from the ticket, set `requiresContext: true` with an explanatory entry in `missingContext`.\n" +
+      "- If you selected `skillCardName: null`, emit `inputs: {}`.\n" +
+      "\n" +
+      "Examples:\n" +
+      '- Ticket "Reset password for jane@example.com" + scaffold declares inputs: {email} → inputs: {"email": "jane@example.com"}\n' +
+      '- Ticket "Unlock account u-001" + scaffold declares inputs: {user_id} → inputs: {"user_id": "u-001"}\n' +
+      "\n" +
+      "TARGET URL RESOLUTION (week2e-dynamic-target-url, Path A+):\n" +
+      "\n" +
+      "The ticket may specify a `targetUrl` that OVERRIDES the scaffold's default base_url. This lets one agent drive multiple tenants / admin portals.\n" +
+      "\n" +
+      "Precedence (emit the corrected URL as `targetUrl` in your JSON response):\n" +
+      '1. If PRIOR PASSES block above contains a URL correction (reviewer note like "go to X", "the correct URL is Y", "use https://customer-b.example.com instead"), adopt that URL as authoritative — emit it as `targetUrl` so the change is auditable in the event log.\n' +
+      "2. Else if the ticket's TARGET URL section below is present, emit that URL verbatim as `targetUrl`.\n" +
+      "3. Else emit `targetUrl: null` — the scaffold's default base_url applies.\n" +
+      "\n" +
+      "Rules:\n" +
+      "- targetUrl must be a well-formed http:// or https:// URL.\n" +
+      "- Do NOT invent URLs; only emit a URL present in the ticket or in a reviewer observation.\n" +
+      "- On ambiguity between multiple URL mentions in observations: most-recent-wins (the latest reviewer guidance beats earlier drafts).\n" +
+      "\n" +
       "No prose outside the JSON.";
 
     // 7b.ii-hotfix-2 — omit the "Submitted by" line entirely when
@@ -875,6 +1217,10 @@ export async function runPlanStep(
       `Ticket: ${ticket?.subject ?? "(unknown)"}\n` +
       `Ticket ID: ${ticket?.ticketId ?? "(unknown)"}\n` +
       (ticket?.submittedBy ? `Submitted by: ${ticket.submittedBy}\n` : "") +
+      // week2e-dynamic-target-url — surface ticket's targetUrl so
+      // plan's prompt can apply TARGET URL RESOLUTION (see system
+      // prompt block). Absent when scaffold default is authoritative.
+      (ticket?.targetUrl ? `TARGET URL (from ticket): ${ticket.targetUrl}\n` : "") +
       `\n` +
       `Classification: ${JSON.stringify(inputData.classification)}\n\n` +
       buildTargetAppContext(inputData.classification.targetApps) +
@@ -935,6 +1281,10 @@ export async function runPlanStep(
         actions: [],
         requiresContext: true,
         missingContext: ["model did not return valid JSON matching PlanSchema"],
+        inputs: {}, // week2d Part 3 — populated for-real by the prompt update (3b)
+        // week2e-dynamic-target-url — refusal path also forwards the
+        // ticket's targetUrl so a refine doesn't drop the override.
+        ...(ticket?.targetUrl ? { targetUrl: ticket.targetUrl } : {}),
       };
     }
 
@@ -1018,6 +1368,70 @@ export async function runPlanStep(
     const narrative =
       typeof parsed.narrative === "string" ? parsed.narrative : "";
 
+    // week2d Part 3 — inputs extraction with soft-fail: apply-time risk
+    // mitigation per Part 3 RFC review. Malformed / non-string values →
+    // default to `{}` + log.warn; does NOT fail the whole plan parse.
+    let inputs: Record<string, string> = {};
+    const rawInputs = parsed.inputs;
+    if (rawInputs && typeof rawInputs === "object" && !Array.isArray(rawInputs)) {
+      const candidate: Record<string, string> = {};
+      let softFailed = false;
+      for (const [k, v] of Object.entries(rawInputs as Record<string, unknown>)) {
+        if (typeof v === "string" && v.length > 0 && v.length <= 500) {
+          candidate[k] = v;
+        } else {
+          softFailed = true;
+        }
+      }
+      if (softFailed) {
+        logger.warn(
+          { runId, keys: Object.keys(rawInputs as Record<string, unknown>) },
+          "[planStep] some inputs entries dropped during validation (non-string / empty / oversize); defaulting those keys to absent",
+        );
+      }
+      inputs = candidate;
+    } else if (rawInputs !== undefined) {
+      logger.warn(
+        { runId, rawInputsType: typeof rawInputs },
+        "[planStep] inputs field was non-object; defaulting to {}",
+      );
+    }
+
+    // week2e-dynamic-target-url — Path A+ parse with soft-fail.
+    // Sonnet may emit `targetUrl` as:
+    //   - a valid http(s) URL → adopt it authoritatively (overrides
+    //     ticket.targetUrl if different — reviewer correction path)
+    //   - null / undefined → fallback to ticket.targetUrl (if any),
+    //     else scaffold's base_url downstream
+    //   - malformed → log.warn + fallback (same as null)
+    // We DO NOT hard-fail plan on a bad targetUrl; reviewer can
+    // correct via Edit-refine.
+    let resolvedTargetUrl: string | undefined;
+    const rawTargetUrl = parsed.targetUrl;
+    if (typeof rawTargetUrl === "string" && rawTargetUrl.length > 0) {
+      if (/^https?:\/\//i.test(rawTargetUrl)) {
+        try {
+          new URL(rawTargetUrl); // parse-check; throws on malformed
+          resolvedTargetUrl = rawTargetUrl;
+        } catch {
+          logger.warn(
+            { runId, rawTargetUrl: rawTargetUrl.slice(0, 120) },
+            "[planStep] targetUrl failed URL parse; falling back to ticket/scaffold",
+          );
+        }
+      } else {
+        logger.warn(
+          { runId, rawTargetUrl: rawTargetUrl.slice(0, 120) },
+          "[planStep] targetUrl must be http(s); falling back",
+        );
+      }
+    }
+    // Default to ticket's targetUrl if Sonnet didn't emit or emitted
+    // something invalid.
+    if (!resolvedTargetUrl && ticket?.targetUrl) {
+      resolvedTargetUrl = ticket.targetUrl;
+    }
+
     // Week-2b-runtime — skill-card resolution.
     //
     // Sonnet's JSON output is expected to include an optional
@@ -1092,6 +1506,11 @@ export async function runPlanStep(
       ...(effectiveMissingContext.length > 0
         ? { missingContext: effectiveMissingContext }
         : {}),
+      inputs, // week2d Part 3 — Sonnet-emitted + soft-failed above
+      // week2e-dynamic-target-url — Sonnet-emitted + ticket-fallback
+      // resolved above. Omitted entirely when no URL override is in
+      // play (scaffold.base_url stays authoritative downstream).
+      ...(resolvedTargetUrl ? { targetUrl: resolvedTargetUrl } : {}),
     };
   }
 }
@@ -1103,133 +1522,316 @@ const planStep = createStep({
   execute: ({ inputData }) => runPlanStep(inputData),
 });
 
+// ─────────────────────────────────────────────────────────────────
+// week2d Part 2 — AGENTIC dry_run (ReAct exploration with browser tools)
+// ─────────────────────────────────────────────────────────────────
+//
+// Replaces week2b-runtime's skill-card-walker preflight with a ReAct
+// loop driven by Sonnet + Part 1's `buildBrowserReactTools()` registry.
+// The agent explores the target app with browser_navigate / snapshot /
+// click / fillForm / takeScreenshot and emits `boundary_reached` when
+// it identifies the destructive step. The pre-authored skill card
+// is reframed from a walker to a SCAFFOLD (hint; not spec) —
+// `formatScaffoldHint` surfaces it in buildSystem.
+//
+// Preserved invariants (identical to week2b-runtime):
+//   - Bug-B hotfix-1 pre-close of ctx.browser before launchBrowser.
+//   - ctx.browser = session on OUTER context (CTX SPREAD INVARIANT).
+//   - Empty skillCardIds → soft-failure early-out (no browser launch).
+//   - SkillCardNotFoundError → soft-failure anomaly.
+//
+// Parallel-operation (Part 2 scope only): execute + verify still walk
+// the pre-authored skill card via loadSkill(plan.skillCardIds[0]).
+// Part 3 wires execute/verify to consume actionTrace via the new
+// materialize_skill_card step.
+
+/** week2d Part 2 — resolves the DRY_RUN_MAX_ITERATIONS env override.
+ *  Clamped [1..50]; invalid / missing values fall through to 15. env.ts
+ *  also validates at boot, so a bad value in .env fails loud before any
+ *  run starts — this is the at-call-site read for clamp safety. */
+function resolveDryRunMaxIterations(): number {
+  const raw = process.env.DRY_RUN_MAX_ITERATIONS;
+  if (!raw) return 15;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1 || n > 50) return 15;
+  return Math.floor(n);
+}
+
+/** Cap list lengths so a pathological skill-card author can't bloat
+ *  the user message beyond the Anthropic context budget. */
+const SCAFFOLD_HINT_MAX_FIELDS = 6;
+
+/** Extract field names from a fillForm step's args. Values are
+ *  intentionally omitted (scaffold-as-hint principle — the agent
+ *  re-derives values from today's UI). */
+function formatFillFormFields(fields: unknown): string {
+  if (!Array.isArray(fields) || fields.length === 0) return "";
+  const names = fields
+    .map((f) => (f as { name?: string })?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0)
+    .slice(0, SCAFFOLD_HINT_MAX_FIELDS);
+  return names.length > 0 ? ` → [${names.join(", ")}]` : "";
+}
+
+/** Surface the scaffold's step shape as hint text — tool + element
+ *  (+ fillForm field names) but NOT pre-authored args.value. Agent
+ *  must re-derive today's UI values via browser_snapshot. Reviewer
+ *  nudge folded in: field names help the agent avoid 1 extra
+ *  iteration per fillForm spent on field discovery. */
+function formatScaffoldHint(skill: Skill): string {
+  return skill.steps
+    .map((step, i) => {
+      const idx = String(i + 1).padStart(2, " ");
+      const args = step.args as Record<string, unknown> | undefined;
+      const element =
+        typeof args?.element === "string"
+          ? args.element
+          : typeof args?.url === "string"
+            ? args.url
+            : "";
+      const fillFormHint =
+        step.tool === "fillForm" ? formatFillFormFields(args?.fields) : "";
+      const destMark = step.destructive
+        ? " [DESTRUCTIVE — call boundary_reached here, do NOT click]"
+        : "";
+      const elementFmt = element ? ` → "${element}"` : "";
+      return `${idx}. ${step.tool}${elementFmt}${fillFormHint}${destMark}`;
+    })
+    .join("\n");
+}
+
+/** week2d Part 2 — closed-over deps for the ReAct config. The
+ *  scaffold + baseUrl are resolved once per dry_run invocation
+ *  (outside the runner) so scaffold-loading errors fall through
+ *  to a clean DryRunSchema soft-fail instead of poisoning the loop
+ *  mid-iteration. */
+interface DryRunDeps {
+  scaffold: Skill;
+  baseUrl: string;
+  ticketSubject: string;
+  ticketId: string;
+  category: string;
+  urgency: string;
+  /** week2d Part 2 hotfix-1 — observations carried forward from
+   *  refine/backtrack loops, threaded via runBlock1's opts.seedObservations
+   *  → runDryRunStep's 3rd param. Surfaced to Sonnet in buildUserMessage
+   *  so reviewer corrections (e.g., "target is leo not jane") actually
+   *  alter the dry_run agent's browser exploration. Without this, the
+   *  refine loop updates plan.inputs but dry_run re-walks the original
+   *  ticket's flow (surfaced by live behavior-shift smoke run
+   *  c43f514c-9742-438a-8dfd-14073f659df7). */
+  priorObservations: string[];
+}
+
+function buildDryRunStepConfig(
+  deps: DryRunDeps,
+): CreateReActStepArgs<z.infer<typeof PlanSchema>, z.infer<typeof DryRunSchema>> {
+  const scaffoldHint = formatScaffoldHint(deps.scaffold);
+  return {
+    id: "dry_run" as const,
+    inputSchema: PlanSchema,
+    outputSchema: DryRunSchema,
+    tier: "sonnet" as const,
+    thinkingEnabled: false,
+    maxIterations: resolveDryRunMaxIterations(),
+    tools: buildBrowserReactTools(),
+    buildSystem: () =>
+      `Explore ${deps.baseUrl} to accomplish this ticket. You have browser ` +
+      `tools (browser_navigate, browser_snapshot, browser_click, ` +
+      `browser_fillForm, browser_takeScreenshot) and a boundary_reached ` +
+      `signal.\n\n` +
+      `Scaffold hint (similar flow — use as reference for shape and for ` +
+      `the destructive step; adapt to TODAY's UI by calling browser_snapshot ` +
+      `and observing actual element names + refs):\n${scaffoldHint}\n\n` +
+      `Required behaviors:\n` +
+      `- Call browser_snapshot BEFORE any click or fillForm to discover refs.\n` +
+      `- BEFORE calling boundary_reached, ensure any confirmation checkboxes, ` +
+      `warning acknowledgments, or required form inputs on the destructive ` +
+      `page are engaged (e.g. an "I confirm" checkbox must be ticked, a ` +
+      `"type DELETE to confirm" input must be filled). The destructive button ` +
+      `is often DISABLED until these preconditions are satisfied; if the ` +
+      `button looks disabled in your snapshot (greyed out, aria-disabled, ` +
+      `etc.), interact with the preconditions FIRST via click/fillForm, then ` +
+      `snapshot again to confirm the button is enabled before proceeding.\n` +
+      `- When you identify the destructive step (the final confirm button that ` +
+      `commits the mutation), call boundary_reached — DO NOT click the ` +
+      `destructive element.\n` +
+      `- Pass scaffoldMatch: true if the element matches the scaffold's ` +
+      `declared destructive step name; false if UI-drift produced a ` +
+      `differently-named-but-same-intent element; omit if unsure.\n\n` +
+      `No preamble. No narration about iterations. Act.`,
+    buildUserMessage: (plan) =>
+      observationsPrefix(deps.priorObservations) +
+      `Ticket: ${deps.ticketSubject || "(no subject)"}\n` +
+      `Ticket ID: ${deps.ticketId}\n` +
+      `Category: ${deps.category}\n` +
+      `Urgency: ${deps.urgency}\n` +
+      `Plan inputs (authoritative — use these EXACT values for any ` +
+      `credentials, target user, or template-substitution values you ` +
+      `encounter during exploration; the reviewer may have corrected ` +
+      `the original ticket):\n` +
+      (Object.keys(plan.inputs).length > 0
+        ? Object.entries(plan.inputs)
+            .map(([k, v]) => `  ${k}: ${v}`)
+            .join("\n")
+        : "  (none)") +
+      `\n\nPlan outline (${plan.actions.length} actions):\n` +
+      plan.actions
+        .slice(0, 10)
+        .map((a, i) => `  ${i + 1}. ${a.verb} → ${a.target}`)
+        .join("\n") +
+      `\n\nBegin exploring. Snapshot first to discover the page structure.`,
+    produceOutput: (iterations, plan) => {
+      const actionTrace: z.infer<typeof DryRunActionSchema>[] = [];
+      let boundaryReached: z.infer<typeof BoundaryReachedSchema> | null = null;
+
+      for (const iter of iterations) {
+        const call = iter.toolCall;
+        if (!call) continue;
+
+        if (call.name === "boundary_reached") {
+          const out = call.output as {
+            element: string;
+            reason: string;
+            scaffoldMatch: boolean | null;
+          };
+          boundaryReached = {
+            element: out.element,
+            reason: out.reason,
+            scaffoldMatch: out.scaffoldMatch,
+            iteration: iter.iteration,
+          };
+          continue;
+        }
+
+        if (
+          call.name === "browser_navigate" ||
+          call.name === "browser_snapshot" ||
+          call.name === "browser_click" ||
+          call.name === "browser_fillForm" ||
+          call.name === "browser_takeScreenshot"
+        ) {
+          actionTrace.push({
+            tool: call.name,
+            args: call.input as Record<string, unknown>,
+          });
+        }
+        // Unknown tool names (impossible via Part 1 registry) skipped.
+      }
+
+      const isExhausted = boundaryReached === null;
+      const anomalies: string[] = isExhausted
+        ? [
+            `Exhausted ${iterations.length} iteration${iterations.length === 1 ? "" : "s"} ` +
+              `without identifying a destructive boundary. The agent explored ` +
+              `but could not confidently flag the destructive step.`,
+          ]
+        : [];
+
+      return {
+        domMatches: !isExhausted,
+        anomalies,
+        plan,
+        actionTrace,
+        boundaryReached,
+      };
+    },
+  };
+}
+
 /** 7b.iii.a — extracted dryRunStep body so the Block 1 controller can
  *  invoke it directly (outside Mastra's step-execution machinery).
- *  `dryRunStep` becomes a thin wrapper; the controller calls this
- *  function and emits its own `step.started` / `step.completed` frames
- *  around the invocation. `priorObservations` is NOT threaded into
- *  dry_run — the step's behavior is deterministic Playwright
- *  orchestration, not an LLM call that could benefit from observations
- *  (the next classify/retrieve/plan passes use them). */
+ *  week2d Part 2 — body rewritten to delegate to the ReAct runner
+ *  after preserving the week2b-runtime session-entry invariants. */
 export async function runDryRunStep(
   inputData: z.infer<typeof PlanSchema>,
   abortSignal: AbortSignal | undefined,
+  priorObservations: string[] = [],
 ): Promise<z.infer<typeof DryRunSchema>> {
-    // Week-2b-runtime — skill-card-driven dry_run. Replaces the pre-runtime
-    // hardcoded Jane-reset preflight sequence; all orchestration knowledge
-    // now lives in `kb/skill_cards/<app>/<skill>.yml` + the
-    // `executeSkillCardSteps` dispatcher.
-    //
-    // Preserved invariants (unchanged from Week-1B hardcoded flow):
-    //   - hotfix-1 pre-close of any existing ctx.browser session before
-    //     launchBrowser (Bug B lock-collision fix).
-    //   - ctx.browser = session is set on the OUTER context (CTX SPREAD
-    //     INVARIANT — session must propagate to executeStep).
-    //   - Error handling: PlaywrightMcpError → anomalies[] +
-    //     domMatches=false (soft failure); unknown errors re-throw.
-    //
-    // New behavior:
-    //   - If `inputData.skillCardIds` is empty (planStep didn't pick a
-    //     card), emit a dry_run anomaly + domMatches=false. Reviewer UI
-    //     will see "needs context" path via the review_gate.
-    //   - Otherwise, loadSkill(name) + extractInputsForSkill(skill,
-    //     ticket) + executeSkillCardSteps(..., preflight: true).
-    const ctx = getRunContext();
-    const { runId, bus, ticket } = ctx;
+  const ctx = getRunContext();
+  const { runId, bus, ticket } = ctx;
 
-    // hotfix-1 pre-close (preserved from Week-1B for intra-Block-1 +
-    // refine + backtrack re-invocations — avoids MCP profile-lock
-    // collision when a second launchBrowser is issued within the same
-    // runId). Silent catch: if the prior transport already died,
-    // close() throws but the profile lock is released regardless.
-    if (ctx.browser) {
-      try {
-        await ctx.browser.close();
-      } catch {
-        // Prior session already dead; lock is released.
-      }
-      ctx.browser = undefined;
+  // ── Bug-B hotfix-1 pre-close (INVARIANT — preserve verbatim) ───
+  // Profile-lock collision prevention across intra-Block-1 multi-pass,
+  // refine re-invocations, and post-exec backtrack re-runs.
+  if (ctx.browser) {
+    try {
+      await ctx.browser.close();
+    } catch {
+      // Prior session already dead; lock released regardless.
     }
+    ctx.browser = undefined;
+  }
 
-    // Early-out: if planStep didn't pick a skill card (empty
-    // skillCardIds), we can't run any preflight. Emit a soft-failure
-    // anomaly so the review gate sees the diagnostic and the reviewer
-    // can Reject (→ refine with directive) or Terminate. Do NOT
-    // launch the browser — launching + immediately closing on empty
-    // input is wasted work and muddies the forensic fingerprints.
-    if (inputData.skillCardIds.length === 0) {
+  // Early-out: no scaffold picked.
+  if (inputData.skillCardIds.length === 0) {
+    return {
+      domMatches: false,
+      anomalies: [
+        "planStep did not select a skill card; dry_run cannot dispatch.",
+      ],
+      plan: inputData,
+      actionTrace: [],
+      boundaryReached: null,
+    };
+  }
+
+  // Load scaffold BEFORE launching the browser — scaffold-loading
+  // errors should not leak a live Chromium subprocess.
+  let scaffold: Skill;
+  let baseUrl: string;
+  try {
+    const loaded = await loadSkill(inputData.skillCardIds[0]!);
+    scaffold = loaded.skill;
+    // week2e-dynamic-target-url — resolution precedence:
+    //   1. plan.targetUrl (set by plan step from Sonnet Path A+ or
+    //      ticket.targetUrl fallback at parse time)
+    //   2. scaffold's declared base_url
+    // Keeps scaffold URL as the last-resort default so existing
+    // smoke paths (no ticket override) behave identically to week2d.
+    baseUrl = inputData.targetUrl ?? loaded.card.base_url;
+  } catch (err) {
+    if (err instanceof SkillCardNotFoundError) {
       return {
         domMatches: false,
-        anomalies: [
-          "planStep did not select a skill card; dry_run cannot dispatch. " +
-            "Pre-runtime Jane-hardcoded flow is retired in Week-2b-runtime.",
-        ],
+        anomalies: [`skill card '${err.skillName}' no longer loadable`],
         plan: inputData,
+        actionTrace: [],
+        boundaryReached: null,
       };
     }
+    throw err;
+  }
 
-    const session = await launchBrowser({
-      runId,
-      bus,
-      stepId: "dry_run",
-      signal: abortSignal,
-    });
-    ctx.browser = session;
+  // Launch + assign on OUTER ctx (CTX SPREAD INVARIANT — session
+  // MUST propagate to executeStep's liveness probe).
+  const session = await launchBrowser({
+    runId,
+    bus,
+    stepId: "dry_run",
+    signal: abortSignal,
+  });
+  ctx.browser = session;
 
-    const anomalies: string[] = [];
-    let domMatches = true;
-
-    try {
-      const loaded = await loadSkill(inputData.skillCardIds[0]!);
-      const inputs = extractInputsForSkill(loaded.skill, {
-        ticketId: ticket?.ticketId ?? "(unknown)",
-        subject: ticket?.subject ?? "",
-      });
-      const tctx: TemplateContext = { inputs };
-
-      const result = await executeSkillCardSteps(loaded.skill, {
-        preflight: true,
-        ctx: tctx,
-        session,
-        baseUrl: loaded.card.base_url,
-      });
-      // `executeSkillCardSteps` catches `PlaywrightMcpError` internally
-      // (bug-2a fix) and returns partial-progress telemetry via
-      // `result.anomalies`. Non-empty anomalies → preflight aborted
-      // mid-flow → DOM does not match the skill card's expected
-      // structure. Empty anomalies → all preflight steps completed
-      // without throwing; the takeScreenshot outputs in the behavior
-      // feed are evidence the DOM matched.
-      if (result.anomalies.length > 0) {
-        anomalies.push(...result.anomalies);
-        domMatches = false;
-        logger.warn(
-          { runId, anomalies: result.anomalies, stepsRun: result.stepsRun },
-          "[dry_run] skill-card preflight aborted mid-flow",
-        );
-      }
-    } catch (err) {
-      if (err instanceof SkillInputExtractionError) {
-        anomalies.push(
-          `skill-input extraction failed: missing '${err.missingKey}' input for this skill (ticket: "${ticket?.subject ?? ""}")`,
-        );
-        domMatches = false;
-        logger.warn(
-          { runId, missingKey: err.missingKey, subject: ticket?.subject },
-          "[dry_run] skill-input extraction failed",
-        );
-      } else if (err instanceof SkillCardNotFoundError) {
-        // Defensive — planStep already validated the name via loadSkill.
-        // If the card disappeared between planStep and here (extreme
-        // race) fall back cleanly.
-        anomalies.push(`skill card '${err.skillName}' no longer loadable`);
-        domMatches = false;
-      } else {
-        throw err;
-      }
-    }
-
-    return { domMatches, anomalies, plan: inputData };
+  // Delegate to ReAct runner. Browser tools read ctx.browser at
+  // invoke time; session is live because we just assigned it.
+  // produceOutput aggregates iterations → DryRunSchema.
+  return runReActIterations<
+    z.infer<typeof PlanSchema>,
+    z.infer<typeof DryRunSchema>
+  >(
+    inputData,
+    abortSignal,
+    buildDryRunStepConfig({
+      scaffold,
+      baseUrl,
+      ticketSubject: ticket?.subject ?? "",
+      ticketId: ticket?.ticketId ?? "(unknown)",
+      category: inputData.classification.category,
+      urgency: inputData.classification.urgency,
+      priorObservations,
+    }),
+  );
 }
 
 const dryRunStep = createStep({
@@ -1237,6 +1839,291 @@ const dryRunStep = createStep({
   inputSchema: PlanSchema,
   outputSchema: DryRunSchema,
   execute: ({ inputData, abortSignal }) => runDryRunStep(inputData, abortSignal),
+});
+
+// ─────────────────────────────────────────────────────────────────
+// week2d Part 3 — `materialize_skill_card` step.
+// ─────────────────────────────────────────────────────────────────
+//
+// Converts the agent's dry_run `actionTrace` + `boundaryReached` into
+// an ephemeral `Skill` stored on `ctx.tempSkillCard`. Execute walks
+// that skill (Part 3b wires the switch). Verify reads its
+// postconditions (Part 3c).
+//
+// CRITICAL MENTAL MODEL — the destructive-append contract:
+//   `boundary_reached` fires BEFORE the destructive click, so
+//   `actionTrace` contains ONLY non-destructive pre-destructive steps.
+//   The destructive action exists ONLY as metadata in
+//   `boundaryReached.element`/`.reason`. The materializer APPENDS a
+//   synthesized destructive click step from `boundaryReached.element`
+//   as the final step of the ephemeral skill. A naive 1-to-1 mapping
+//   would produce a skill with zero `destructive: true` steps, which
+//   executeSkillCardSteps (with `resumeAtFirstDestructive: true`)
+//   would no-op on — killing P1 smoke on arrival. See
+//   reactBrowserTools.ts boundary_reached docstring + Part 3 RFC §4.
+
+/** Anthropic tool names → `SkillStep.tool` enum. */
+const REACT_TO_SKILL_TOOL_MAP: Record<string, Skill["steps"][number]["tool"]> = {
+  browser_navigate: "navigate",
+  browser_snapshot: "snapshot",
+  browser_click: "click",
+  browser_fillForm: "fillForm",
+  browser_takeScreenshot: "takeScreenshot",
+};
+
+/** Part 2 click-arg `ref` is ephemeral (snapshot-scoped). Skill-card
+ *  executor re-resolves refs at dispatch time via `resolveClickRef` —
+ *  stale refs are dead weight. Strip for cleaner materialized args. */
+function stripEphemeralRef(args: Record<string, unknown>): Record<string, unknown> {
+  const { ref: _ref, ...rest } = args as { ref?: unknown; [k: string]: unknown };
+  return rest;
+}
+
+/** Replace verbatim-match literals in a string with
+ *  `{{ inputs.<key> }}` placeholders. First-declared-wins on
+ *  collision (iteration order of `Object.entries(inputs)`). */
+function substituteInputsInStringArg(
+  value: string,
+  inputs: Record<string, string>,
+): string {
+  for (const [key, v] of Object.entries(inputs)) {
+    if (v && value === v) return `{{ inputs.${key} }}`;
+  }
+  return value;
+}
+
+/** Walk args tree; for each string leaf, apply
+ *  `substituteInputsInStringArg`. Non-string leaves passthrough. */
+function substituteInputsInArgs(
+  args: Record<string, unknown>,
+  inputs: Record<string, string>,
+): Record<string, unknown> {
+  function walk(v: unknown): unknown {
+    if (typeof v === "string") return substituteInputsInStringArg(v, inputs);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v !== null && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, vv] of Object.entries(v)) out[k] = walk(vv);
+      return out;
+    }
+    return v;
+  }
+  return walk(args) as Record<string, unknown>;
+}
+
+/** Map ReAct `DryRunAction[]` + boundaryReached → `SkillStep[]`.
+ *  Appends synthesized destructive click from `boundaryReached.element`
+ *  after the non-destructive prefix (see critical mental model above). */
+function materializeSteps(
+  actionTrace: z.infer<typeof DryRunActionSchema>[],
+  boundaryReached: z.infer<typeof BoundaryReachedSchema> | null,
+  inputs: Record<string, string>,
+): Skill["steps"] {
+  const baseSteps: Skill["steps"] = actionTrace.map((a) => ({
+    tool: REACT_TO_SKILL_TOOL_MAP[a.tool]!,
+    args: substituteInputsInArgs(stripEphemeralRef(a.args), inputs),
+    destructive: false,
+  }));
+
+  if (boundaryReached) {
+    baseSteps.push({
+      tool: "click",
+      args: {
+        element: substituteInputsInStringArg(boundaryReached.element, inputs),
+      },
+      destructive: true,
+    });
+  }
+  // Exhaustion path (boundaryReached === null): caller throws per
+  // §11 #4. baseSteps returned as-is for observability; execute would
+  // no-op + verify hard-fail.
+  return baseSteps;
+}
+
+/** Infer SkillInput metadata from a value string when scaffold didn't
+ *  declare the key. Value-shape heuristics only — runtime template
+ *  engine doesn't use the metadata, so this just seeds a better audit
+ *  artifact. */
+function inferSkillInputFromValue(value: string): SkillInput {
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+    return { type: "email", required: true };
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    return { type: "uuid", required: true };
+  }
+  return { type: "string", required: true };
+}
+
+/** Derive ephemeral skill's `inputs:` block. Inherits scaffold's
+ *  author-declared metadata when available (description, type hints,
+ *  required-ness); infers only for keys the scaffold doesn't declare.
+ *  Preserves curated metadata = better audit artifact. */
+function deriveSkillInputs(
+  planInputs: Record<string, string>,
+  scaffoldInputs: Record<string, SkillInput> | undefined,
+): Record<string, SkillInput> {
+  const result: Record<string, SkillInput> = {};
+  for (const [key, value] of Object.entries(planInputs)) {
+    result[key] = scaffoldInputs?.[key] ?? inferSkillInputFromValue(value);
+  }
+  return result;
+}
+
+/** Walk scaffold.steps for the first step with `destructive: true`;
+ *  return its `args.element` (or `args.url` for navigate destructive
+ *  steps, which is unusual but possible). Fallback to scaffold.name
+ *  if no step is marked destructive (defensive — shouldn't happen per
+ *  skill-card loader cross-field assert). */
+function findScaffoldDestructiveElement(scaffold: Skill): string {
+  for (const step of scaffold.steps) {
+    if (!step.destructive) continue;
+    const args = step.args as Record<string, unknown>;
+    if (typeof args.element === "string") return args.element;
+    if (typeof args.url === "string") return args.url;
+  }
+  return scaffold.name;
+}
+
+/** Extracted materialize body — Part 3's `materializeSkillCardStep`
+ *  Mastra wrapper delegates to this (extracting `.dryRun` from its
+ *  ReviewSchema input); humanVerifyGateStep's backtrack loop
+ *  direct-invokes it with the gate's ReviewSchema output.
+ *
+ *  `review` is threaded through onto the output so downstream
+ *  `runExecuteStep` can detect the skip-cascade path via
+ *  `review.approved === false`. Callers that don't need the
+ *  skip-cascade semantic (unit tests, synthetic scenarios) can pass
+ *  a happy-path review stub — see `materializeSkillCard.test.ts`. */
+export async function runMaterializeSkillCardStep(
+  inputData: z.infer<typeof DryRunSchema>,
+  review: z.infer<typeof ReviewSchema>,
+): Promise<z.infer<typeof MaterializeSchema>> {
+  const ctx = getRunContext();
+  const { plan, actionTrace, boundaryReached } = inputData;
+
+  // Defensive: exhausted dry_run → UI should have disabled Approve
+  // (Part 0 §7 Part 4 guard). If we're here, that guard failed; throw.
+  if (!boundaryReached) {
+    throw new Error(
+      "[materialize] dry_run exhausted without boundary_reached; approve-on-exhausted is a UI-bug.",
+    );
+  }
+
+  // Load scaffold for divergence detection + postcondition inheritance
+  // + baseUrl plumbing (resolution of Part 3 RFC §11 #1).
+  if (plan.skillCardIds.length === 0) {
+    throw new Error("[materialize] plan.skillCardIds is empty; cannot resolve scaffold.");
+  }
+  const loaded = await loadSkill(plan.skillCardIds[0]!);
+  const scaffold = loaded.skill;
+
+  // Divergence = scaffoldMatch explicitly false. null (agent omitted)
+  // is NOT divergence — reviewer decides at the gate.
+  const divergence: z.infer<typeof DivergenceSchema> | null =
+    boundaryReached.scaffoldMatch === false
+      ? {
+          expected: findScaffoldDestructiveElement(scaffold),
+          actual: boundaryReached.element,
+          reason: boundaryReached.reason,
+        }
+      : null;
+
+  // Build ephemeral skill from actionTrace + inputs + append
+  // synthesized destructive click.
+  const steps = materializeSteps(actionTrace, boundaryReached, plan.inputs);
+  const ephemeralSkill: Skill = {
+    name: `${scaffold.name}_materialized`,
+    description: scaffold.description,
+    destructive: plan.destructive,
+    inputs: deriveSkillInputs(plan.inputs, scaffold.inputs),
+    preconditions: scaffold.preconditions,
+    postconditions: scaffold.postconditions,
+    steps,
+  };
+
+  // Validate — materialized card conforms to existing SkillSchema.
+  const parsed = SkillSchema.safeParse(ephemeralSkill);
+  if (!parsed.success) {
+    throw new Error(
+      `[materialize] ephemeral skill failed SkillSchema validation: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`,
+    );
+  }
+
+  // Side effect: write to RunContext for downstream execute + verify.
+  // Outer-scope assignment — tempSkillCard is read-only-safe-to-spread
+  // (see CTX SPREAD INVARIANT), but this is the WRITE site so it must
+  // land on the outer ctx, not a spread copy.
+  ctx.tempSkillCard = parsed.data;
+
+  // week2d Part 3b — persist to Postgres with the convention name
+  // <sanitized-hostname>_<scaffold-name>_<uuid>. The UUID is fresh
+  // per materialization and doubles as the future Qdrant collection
+  // UUID (embedding deferred). Persistence is non-blocking: failures
+  // log.warn but don't abort the run (ephemeral ctx.tempSkillCard is
+  // what execute reads; DB row is audit only).
+  // week2e-dynamic-target-url — resolve effective baseUrl with same
+  // precedence runDryRunStep used: plan.targetUrl (reviewer/ticket)
+  // wins, else scaffold. Persisted to materialized_skills.base_url
+  // AND surfaced on MaterializeSchema.baseUrl so execute uses the
+  // corrected origin when it walks the skill.
+  const effectiveBaseUrl = plan.targetUrl ?? loaded.card.base_url;
+
+  const skillId = randomUUID();
+  const skillName = buildMaterializedSkillName(
+    effectiveBaseUrl,
+    scaffold.name,
+    skillId,
+  );
+  await insertMaterializedSkill({
+    id: skillId,
+    name: skillName,
+    runId: ctx.runId,
+    scaffoldName: scaffold.name,
+    baseUrl: effectiveBaseUrl,
+    skill: parsed.data,
+    divergence,
+  });
+
+  return {
+    skill: parsed.data,
+    skillId,
+    skillName,
+    baseUrl: effectiveBaseUrl,
+    divergence,
+    dryRun: inputData,
+    review,
+  };
+}
+
+const materializeSkillCardStep = createStep({
+  id: "materialize_skill_card",
+  // Mastra-chain input is reviewGateStep's output (ReviewSchema).
+  // Wrapper extracts `.dryRun` for the materialize body; threads
+  // the full ReviewSchema through as `review` for downstream
+  // skip-cascade detection.
+  inputSchema: ReviewSchema,
+  outputSchema: MaterializeSchema,
+  execute: async ({ inputData }) => {
+    if (!inputData.approved) {
+      // Skip-cascade path — synthesize a minimal valid MaterializeSchema
+      // without invoking the materialize body OR the DB persistence.
+      // runExecuteStep checks `inputData.review.approved` before reading
+      // .skill. skillId + skillName use deterministic sentinels so
+      // downstream code (including future grep tools) can distinguish
+      // skipped materializations from real ones.
+      const skippedId = randomUUID();
+      return {
+        skill: MINIMAL_SKIPPED_SKILL,
+        skillId: skippedId,
+        skillName: `skipped_${skippedId}`,
+        baseUrl: "http://skipped.invalid/",
+        divergence: null,
+        dryRun: inputData.dryRun,
+        review: inputData,
+      };
+    }
+    return runMaterializeSkillCardStep(inputData.dryRun, inputData);
+  },
 });
 
 /** 7b.iii.b — extracted reviewGate body so humanVerifyGateStep
@@ -1459,61 +2346,58 @@ const reviewGateStep = createStep({
 
 const executeStep = createStep({
   id: "execute",
-  inputSchema: ReviewSchema,
+  // week2d Part 3 — chain shifted: materialize emits MaterializeSchema.
+  inputSchema: MaterializeSchema,
   outputSchema: ExecuteSchema,
   execute: ({ inputData }) => runExecuteStep(inputData),
 });
 
 /** 7b.iii.b — extracted executeStep body so humanVerifyGateStep can
  *  re-invoke it on a backtrack. Direct-call bypass of Mastra's
- *  engine is consistent with runReviewGateStep / runVerifyStep. */
+ *  engine is consistent with runReviewGateStep / runVerifyStep.
+ *
+ *  week2d Part 3 — input swapped from ReviewSchema to MaterializeSchema.
+ *  Skill comes from `ctx.tempSkillCard` (written by materialize);
+ *  baseUrl comes from `inputData.baseUrl` (forwarded from scaffold,
+ *  resolution of Part 3 RFC §11 #1 — no scaffold re-load here).
+ *  `inputData.review` preserves the skip-cascade check that was
+ *  previously driven by `inputData.approved` on ReviewSchema. */
 export async function runExecuteStep(
-  inputData: z.infer<typeof ReviewSchema>,
+  inputData: z.infer<typeof MaterializeSchema>,
 ): Promise<z.infer<typeof ExecuteSchema>> {
   {
     const ctx = getRunContext();
     const { runId, bus } = ctx;
+    const review = inputData.review;
 
-    if (!inputData.approved) {
-      // Rejection path: the step.completed frame emitted by stepEmitter is a
-      // sufficient boundary marker. Emitting a lone tool.started here would
-      // orphan a span in any timeline UI that brackets tool work by
-      // started/completed pairs. The `skipped: true` flag in the returned
-      // output cascades through verify/log_and_notify and ends up in
-      // run.completed { status: "rejected" }, which is the right signal for
-      // downstream consumers.
-      return { stepsRun: 0, skipped: true, review: inputData };
+    if (!review.approved) {
+      // Rejection path: same semantic as pre-Part-3 — skipped flag
+      // cascades through verify/log_and_notify → run.completed
+      // { status: "rejected" }.
+      return { stepsRun: 0, skipped: true, review };
     }
 
-    // Week-2b-runtime — skill-card-driven execute. Replaces the
-    // pre-runtime hardcoded Jane-reset click sequence. Executes the
-    // FULL skill-card steps array (preflight: false) — so the
-    // destructive-confirm click that dry_run stopped before gets
-    // executed here after reviewer approval.
+    // week2d Part 3 — session handling UNCHANGED from week2b-runtime
+    // (liveness-probe + three branches). Only the INPUT SOURCE changed:
+    //   - Was:  loadSkill(plan.skillCardIds[0])    (loaded scaffold)
+    //   - Now:  ctx.tempSkillCard                   (materialized skill)
+    //   - baseUrl: was loaded.card.base_url        (scaffold re-load)
+    //              now inputData.baseUrl           (materialize forward)
     //
-    // Session handling — liveness-probe + three branches:
-    //   1. ctx.browser alive (happy path, fast reviewer): reuse and
-    //      resume at first destructive step. Skips 3-5s of re-login;
-    //      makes read-only skills (no destructive step) a correct
-    //      no-op at execute.
-    //   2. ctx.browser dead (reviewer sat on gate past session TTL):
-    //      pre-close + fresh launch + run full skill card. Graceful
-    //      degrade; logged at warn level for ops visibility.
-    //   3. ctx.browser undefined (dry_run threw before launch): fresh
-    //      launch + run full skill card. No reuse possible.
-    //
-    // Success evidence lives in the `takeScreenshot` step(s) the skill
-    // card declares; verifyStep (unchanged in 2b) asserts the
-    // postcondition text.
-    if (inputData.dryRun.plan.skillCardIds.length === 0) {
-      // Defensive — review_gate would've seen the dry_run anomaly and
-      // the reviewer would've rejected/terminated. If we somehow
-      // reach execute with an empty skillCardIds, bail cleanly.
+    // The materialized skill's trailing step is the destructive click
+    // appended from boundaryReached.element, so `resumeAtFirstDestructive:
+    // true` on the reused-session path fast-forwards straight to it.
+
+    const skill = ctx.tempSkillCard;
+    if (!skill) {
+      // Defensive — materialize always runs before execute on the
+      // approve path. If we hit this, a future refactor bypassed
+      // materialize.
       logger.error(
         { runId },
-        "[execute] no skill card in plan; cannot dispatch",
+        "[execute] ctx.tempSkillCard missing; cannot dispatch",
       );
-      return { stepsRun: 0, skipped: false, review: inputData };
+      return { stepsRun: 0, skipped: false, review };
     }
 
     const existing = ctx.browser;
@@ -1569,21 +2453,22 @@ export async function runExecuteStep(
 
     let stepsRun = 0;
     try {
-      const loaded = await loadSkill(inputData.dryRun.plan.skillCardIds[0]!);
-      const inputs = extractInputsForSkill(loaded.skill, {
-        ticketId: ctx.ticket?.ticketId ?? "(unknown)",
-        subject: ctx.ticket?.subject ?? "",
-      });
+      // week2d Part 3 — inputs come from plan.inputs (populated by
+      // 3b's plan prompt update); materialized skill's template
+      // placeholders (`{{ inputs.X }}`) resolve via these values.
+      // No extractInputsForSkill fallback needed — materializer only
+      // sets placeholders for keys actually in plan.inputs.
+      const inputs = inputData.dryRun.plan.inputs;
       const tctx: TemplateContext = { inputs };
 
       const result: ExecuteSkillResult = await executeSkillCardSteps(
-        loaded.skill,
+        skill,
         {
           preflight: false,
           resumeAtFirstDestructive,
           ctx: tctx,
           session,
-          baseUrl: loaded.card.base_url,
+          baseUrl: inputData.baseUrl,
         },
       );
       stepsRun = result.stepsRun;
@@ -1597,22 +2482,17 @@ export async function runExecuteStep(
         );
       }
     } catch (err) {
-      if (err instanceof SkillInputExtractionError) {
-        logger.warn(
-          { runId, missingKey: err.missingKey },
-          "[execute] skill-input extraction failed mid-run",
-        );
-      } else if (err instanceof SkillCardNotFoundError) {
-        logger.error(
-          { runId, skillName: err.skillName },
-          "[execute] skill card no longer loadable",
-        );
-      } else {
-        throw err;
-      }
+      // week2d Part 3 — SkillCardNotFoundError no longer fires here
+      // (scaffold is loaded in materialize, not execute). Keep the
+      // catch defensive in case executor wraps an unexpected error.
+      logger.error(
+        { runId, err: (err as Error).message },
+        "[execute] unexpected failure during skill-card dispatch",
+      );
+      throw err;
     }
 
-    return { stepsRun, skipped: false, review: inputData };
+    return { stepsRun, skipped: false, review };
   }
 }
 
@@ -1624,48 +2504,147 @@ const verifyStep = createStep({
 });
 
 /** 7b.iii.b — extracted verifyStep body so humanVerifyGateStep can
- *  re-invoke it on a backtrack. */
+ *  re-invoke it on a backtrack.
+ *
+ *  week2d Part 3c — REDESIGNED as structured postcondition comparison
+ *  (no ReAct, no `/verified/i` regex). Flow:
+ *
+ *    1. Skip cascade:       inputData.skipped → pass-through
+ *    2. Hard-fail guard:    stepsRun===0 && !skipped → success: false
+ *                           BEFORE any LLM call (Polish-queue #2 fold —
+ *                           closes the hallucination surface where
+ *                           Sonnet's regex-matched /verified/i on a
+ *                           0-step executeStep falsely reported ok).
+ *    3. Structured judge:   read ctx.tempSkillCard.postconditions +
+ *                           a fresh browser snapshot; single Sonnet
+ *                           call returns {success, evidence[]} as JSON.
+ *    4. Fallback:           if no postconditions declared OR no browser
+ *                           session, degrade to success=(stepsRun > 0)
+ *                           with an observability evidence entry. */
 export async function runVerifyStep(
   inputData: z.infer<typeof ExecuteSchema>,
 ): Promise<z.infer<typeof VerifySchema>> {
-  {
-    const { runId, bus } = getRunContext();
+  const ctx = getRunContext();
+  const { runId, bus } = ctx;
 
-    if (inputData.skipped) {
-      return {
-        success: false,
-        skipped: true,
-        evidence: [],
-        execute: inputData,
-      };
-    }
-
-    // Canned: emit a brief sonnet call (thinking off) so the timeline
-    // exercises llm.text.delta without ballooning token cost.
-    const system =
-      "You verify an IT helpdesk action. Reply with a single sentence: 'verified' or 'needs-review'.";
-    const userMsg =
-      `Execute result: stepsRun=${inputData.stepsRun}, review decision=${inputData.review.decision}. Verify.`;
-
-    const result = await streamMessage({
-      runId,
-      bus,
-      stepId: "verify",
-      tier: "sonnet",
-      maxTokens: 128,
-      thinkingEnabled: false,
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    });
-
-    const success = /verified/i.test(result.text);
+  // 1) Skip cascade — unchanged pre-3c behavior.
+  if (inputData.skipped) {
     return {
-      success,
-      skipped: false,
-      evidence: [result.text.trim().slice(0, 200)],
+      success: false,
+      skipped: true,
+      evidence: [],
       execute: inputData,
     };
   }
+
+  // 2) Hard-fail guard — polish-queue #2 fold (closed in Part 3c).
+  //    Runs BEFORE the LLM call so verify can't hallucinate "verified"
+  //    on a 0-step executeStep (7b.iii.b meta-observation).
+  if (inputData.stepsRun === 0) {
+    logger.warn(
+      { runId, stepsRun: 0, reviewDecision: inputData.review.decision },
+      "[verify] hard-fail: stepsRun=0 && !skipped (polish #2 guard)",
+    );
+    return {
+      success: false,
+      skipped: false,
+      evidence: ["executeStep ran 0 steps; no mutation could have occurred"],
+      execute: inputData,
+    };
+  }
+
+  const skill = ctx.tempSkillCard;
+  const postconditions = skill?.postconditions ?? [];
+
+  // 4a) Fallback — no postconditions declared OR no browser session.
+  //     Degrade to success=(stepsRun > 0). This is the structural
+  //     signal: if execute ran steps, the skill-card walker got
+  //     through without throwing, so the mutation likely happened.
+  //     Evidence cites the degradation reason for audit.
+  if (postconditions.length === 0 || !ctx.browser) {
+    const reason =
+      postconditions.length === 0
+        ? `No postconditions declared on tempSkillCard ("${skill?.name ?? "<missing>"}"); structural success based on stepsRun=${inputData.stepsRun}.`
+        : `No active browser session; cannot snapshot for postcondition comparison. Structural success based on stepsRun=${inputData.stepsRun}.`;
+    logger.info(
+      { runId, stepsRun: inputData.stepsRun, degraded: true },
+      "[verify] degraded to structural success check",
+    );
+    return {
+      success: inputData.stepsRun > 0,
+      skipped: false,
+      evidence: [reason],
+      execute: inputData,
+    };
+  }
+
+  // 3) Structured LLM-judge path. Single Sonnet call; thinking off.
+  //    Prompt shape follows the Lever-B terse convention from
+  //    week2c-react-claude-verbosity (no preamble, no narration).
+  const snap = await ctx.browser.snapshot();
+  const domText = snap.text;
+
+  const system =
+    "Verify postconditions against the final DOM text. " +
+    'Return JSON only: {"success": bool, "evidence": [string]}. ' +
+    "- `success=true` IFF every postcondition is observably satisfied in the DOM text. " +
+    "- `evidence`: exactly one entry per postcondition, each citing the specific DOM token or phrase that confirms (or falsifies) it. " +
+    "- On any unsatisfied postcondition: `success=false`; the corresponding evidence entry cites what's missing. " +
+    "No preamble. No narration. JSON only.";
+
+  const userMsg =
+    `Postconditions to verify (${postconditions.length}):\n` +
+    postconditions.map((p, i) => `${i + 1}. ${p}`).join("\n") +
+    `\n\nFinal DOM:\n${domText.slice(0, 8000)}\n\nEmit the JSON verdict.`;
+
+  const result = await streamMessage({
+    runId,
+    bus,
+    stepId: "verify",
+    tier: "sonnet",
+    maxTokens: 512,
+    thinkingEnabled: false,
+    system,
+    messages: [{ role: "user", content: userMsg }],
+  });
+
+  // Parse the structured JSON. On parse failure: soft-fail to
+  // success=false with the raw text as evidence (same pattern as
+  // planStep's parse fallback — doesn't crash verify, surfaces the
+  // model drift for the reviewer's audit).
+  const parsed = tryParseJson<{ success?: unknown; evidence?: unknown }>(
+    result.text,
+  );
+  if (!parsed || typeof parsed !== "object") {
+    logger.warn(
+      { runId, responsePreview: result.text.slice(0, 200) },
+      "[verify] structured JSON parse failed; returning success=false",
+    );
+    return {
+      success: false,
+      skipped: false,
+      evidence: [
+        `verify model returned non-JSON output: ${result.text.trim().slice(0, 200)}`,
+      ],
+      execute: inputData,
+    };
+  }
+
+  const success = parsed.success === true;
+  const evidence: string[] = Array.isArray(parsed.evidence)
+    ? (parsed.evidence as unknown[])
+        .map((e) => String(e).slice(0, 400))
+        .slice(0, 10)
+    : [
+        `verify model returned success=${String(parsed.success)} but no evidence array`,
+      ];
+
+  return {
+    success,
+    skipped: false,
+    evidence,
+    execute: inputData,
+  };
 }
 
 const logAndNotifyStep = createStep({
@@ -1780,6 +2759,11 @@ function block1ResultToDryRun(
       domMatches: r.finalState.dryRun.domMatches,
       anomalies: r.finalState.dryRun.anomalies,
       plan: r.finalState.plan,
+      // week2d Part 2 — forward from dry_run if present (happy path
+      // always has them after Part 2 lands); fallback [] / null for
+      // any caller/test that still returns the pre-Part-2 shape.
+      actionTrace: r.finalState.dryRun.actionTrace ?? [],
+      boundaryReached: r.finalState.dryRun.boundaryReached ?? null,
     };
   }
   // Exhausted. If a dry_run happened to run on any pass we reuse its
@@ -1797,6 +2781,11 @@ function block1ResultToDryRun(
       passedLast: r.passedLast,
       allReasons: r.allReasons,
     },
+    // week2d Part 2 — forward any partial trace from the last pass that
+    // ran dry_run; boundary never reached on exhausted Block 1 (else
+    // the pass would have been exit_signal_ok).
+    actionTrace: r.finalState.dryRun?.actionTrace ?? [],
+    boundaryReached: null,
   };
 }
 
@@ -2202,6 +3191,10 @@ const humanVerifyGateStep = createStep({
               domMatches: block1.finalState.dryRun.domMatches,
               anomalies: block1.finalState.dryRun.anomalies,
               plan: block1.finalState.plan,
+              // week2d Part 2
+              actionTrace: block1.finalState.dryRun.actionTrace ?? [],
+              boundaryReached:
+                block1.finalState.dryRun.boundaryReached ?? null,
             }
           : {
               domMatches: false,
@@ -2214,6 +3207,9 @@ const humanVerifyGateStep = createStep({
                 passedLast: block1.passedLast,
                 allReasons: block1.allReasons,
               },
+              // week2d Part 2
+              actionTrace: block1.finalState.dryRun?.actionTrace ?? [],
+              boundaryReached: null,
             };
 
       // Re-enter review_gate. Pre-exec terminate (or the internal
@@ -2240,7 +3236,33 @@ const humanVerifyGateStep = createStep({
           },
         } satisfies z.infer<typeof VerifySchema>;
       } else {
-        const exec = await runExecuteStep(gate1Out);
+        // week2d Part 3 — materialize lands between reviewGate and
+        // execute in the backtrack chain (mirrors the Mastra chain
+        // insertion). Each backtrack iteration produces a fresh
+        // actionTrace → fresh ctx.tempSkillCard → fresh execute walk.
+        // Wrap in synthetic step.started/completed frames so the
+        // LEFT column's <StepOutcome> updates across backtracks
+        // (same pattern as Piece B's synthetic block1 frames).
+        const matStartedAt = Date.now();
+        bus.publish({
+          runId,
+          stepId: "materialize_skill_card",
+          payload: { type: "step.started" },
+        });
+        const matOut = await runMaterializeSkillCardStep(
+          gate1Out.dryRun,
+          gate1Out,
+        );
+        bus.publish({
+          runId,
+          stepId: "materialize_skill_card",
+          payload: {
+            type: "step.completed",
+            output: matOut,
+            durationMs: Date.now() - matStartedAt,
+          },
+        });
+        const exec = await runExecuteStep(matOut);
         nextVerify = await runVerifyStep(exec);
       }
 
@@ -2260,6 +3282,7 @@ export const triageWorkflow = createWorkflow({
 })
   .then(block1Step)            // 7b.iii.a — wraps classify → retrieve → plan → dry_run
   .then(reviewGateStep)        // pre-exec gate (Commit 2) — reject terminates; edit triggers refine loop
+  .then(materializeSkillCardStep) // week2d Part 3 — actionTrace → ephemeral Skill in ctx.tempSkillCard
   .then(executeStep)
   .then(verifyStep)
   .then(humanVerifyGateStep)   // 7b.iii.b commit 4 — post-exec gate; reject triggers backtrack to Block 1

@@ -1682,3 +1682,93 @@ code, pre { font-family: var(--mono); }
 .status-warn .status-dot { background: var(--warn); }
 .status-err  { border-left-color: var(--err); }
 .status-err  .status-dot { background: var(--err); animation: pulse 1.6s ease-in-out infinite; }
+
+/* ─────────────────────────────────────────────────────────────
+   week2d Part 4 — divergence banner (BehaviorFeed) + materialize
+   outcome chip (LEFT column). Warn-yellow accent mirroring the
+   post-exec backtrack banner's palette (rgba(242,182,65,...) —
+   the --warn-rgb token is polish-queued).
+   ───────────────────────────────────────────────────────────── */
+
+.feed-divergence-banner {
+  grid-column: 1 / -1;
+  margin: 12px 0;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(242, 182, 65, 0.5);
+  background: linear-gradient(180deg, rgba(242, 182, 65, 0.1), transparent 70%),
+    var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feed-divergence-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.feed-divergence-icon {
+  font-size: 16px;
+  color: var(--warn);
+}
+
+.feed-divergence-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.feed-divergence-row {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+  align-items: baseline;
+}
+
+.feed-divergence-label {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.feed-divergence-value {
+  font-family: var(--mono);
+  color: var(--text);
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.feed-divergence-reason {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.feed-divergence-footer {
+  margin-top: 6px;
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Materialize outcome chip in the LEFT column row. Warn-yellow
+   pill when divergence is non-null; functions as a tooltip host
+   via the title attribute (expected / actual / reason on hover). */
+.materialize-divergence-chip {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(242, 182, 65, 0.12);
+  border: 1px solid rgba(242, 182, 65, 0.4);
+  color: var(--warn);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: help;
+}

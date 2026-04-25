@@ -239,16 +239,30 @@ Seeded users to play with (every `email@example.com` works; any non-empty passwo
 
 ## 1.6 End-to-end `/triage` with real RAG + real browser (Week 1B, post-7b.iii.b commit 4)
 
-As of Week-2a (gate-decision-model + hotfix-1), the workflow is a **9-step chain with TWO human gates, 4 decision inputs per gate**:
+As of week2d + week2e, the workflow is a **10-step chain with TWO human gates, 4 decision inputs per gate** + ephemeral-skill materialization + structured verify:
 
 ```
-block1Step (classify → retrieve → plan → dry_run, up to 3 passes)
+block1Step (classify → retrieve → plan → dry_run-AGENTIC-REACT, up to 3 passes)
   → reviewGateStep (PRE-EXEC GATE: approve / reject-replan / edit-replan / terminate)
-  → executeStep
-  → verifyStep
+  → materializeSkillCardStep (week2d Part 3b — actionTrace + boundaryReached
+                              → ephemeral Skill → ctx.tempSkillCard + Postgres row)
+  → executeStep (walks ctx.tempSkillCard; baseUrl from materialize)
+  → verifyStep (week2d Part 3c — structured JSON over postconditions)
   → humanVerifyGateStep (POST-EXEC GATE: approve / reject-backtrack / terminate)
   → logAndNotifyStep
 ```
+
+**POST /triage body** (week2e-dynamic-target-url):
+```
+{
+  "ticketId":   string,
+  "subject":    string,
+  "submittedBy": string?,
+  "targetUrl":   string?   // optional; http(s) only; overrides scaffold's base_url
+}
+```
+Bad scheme → HTTP 400. See §13 "REVIEWER-CONTROL VIA EDIT-REFINE" in
+`docs/Architecture.txt` for the reviewer-correction audit pattern.
 
 **4-decision semantics** (Week-2a gate-decision-model):
 - `approve` — proceed (unchanged).

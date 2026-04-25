@@ -37,6 +37,16 @@ const triageBodySchema = z.object({
   ticketId: z.string().min(1).max(200),
   subject: z.string().min(1).max(500),
   submittedBy: z.string().min(1).max(200).optional(),
+  /** week2e-dynamic-target-url — optional URL override. When present,
+   *  the agent resolves against this URL instead of the scaffold's
+   *  base_url. Polish #28 tracks per-tenant origin allowlist; for
+   *  now we only enforce the http(s) scheme guard. */
+  targetUrl: z
+    .string()
+    .url()
+    .regex(/^https?:\/\//i, "must be http:// or https://")
+    .max(2048)
+    .optional(),
 });
 
 /** How long to wait before disposing the in-memory run state after a run
@@ -63,7 +73,7 @@ export function triageRouter(deps: { bus: EventBus; db: Database }): Hono {
         400,
       );
     }
-    const { ticketId, subject, submittedBy } = parsed.data;
+    const { ticketId, subject, submittedBy, targetUrl } = parsed.data;
 
     const runId = randomUUID();
     await deps.db.insert(runs).values({
@@ -75,12 +85,18 @@ export function triageRouter(deps: { bus: EventBus; db: Database }): Hono {
       startedAt: new Date(),
     });
 
-    logger.info({ runId, ticketId }, "[triage] run started");
+    logger.info({ runId, ticketId, targetUrl }, "[triage] run started");
 
     // Fire-and-forget. Errors inside the workflow body are logged and reflected
     // in the envelope timeline via run.failed; the HTTP response has already
     // returned by then.
-    void runTriageWorkflow(deps, { runId, ticketId, subject, submittedBy }).catch(
+    void runTriageWorkflow(deps, {
+      runId,
+      ticketId,
+      subject,
+      submittedBy,
+      targetUrl,
+    }).catch(
       (err) => {
         logger.error({ runId, err }, "[triage] workflow wrapper failed");
       },
@@ -102,10 +118,12 @@ async function runTriageWorkflow(
     ticketId: string;
     subject: string;
     submittedBy: string | undefined;
+    /** week2e-dynamic-target-url */
+    targetUrl: string | undefined;
   },
 ): Promise<void> {
   const { bus, db } = deps;
-  const { runId, ticketId, subject, submittedBy } = args;
+  const { runId, ticketId, subject, submittedBy, targetUrl } = args;
   const startedAt = Date.now();
 
   // Create the workflow run. Mastra accepts a runId override so we match
@@ -130,6 +148,7 @@ async function runTriageWorkflow(
         ticketId,
         subject,
         ...(submittedBy ? { submittedBy } : {}),
+        ...(targetUrl ? { targetUrl } : {}),
       },
     },
   });
@@ -155,7 +174,12 @@ async function runTriageWorkflow(
   const ctx: RunContext = {
     runId,
     bus,
-    ticket: { ticketId, subject, ...(submittedBy ? { submittedBy } : {}) },
+    ticket: {
+      ticketId,
+      subject,
+      ...(submittedBy ? { submittedBy } : {}),
+      ...(targetUrl ? { targetUrl } : {}),
+    },
   };
 
   try {

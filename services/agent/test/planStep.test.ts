@@ -459,4 +459,239 @@ describe("planStep — structured JSON output (7b.ii-hotfix)", () => {
       // undefined — Zod's default behavior on z.string().optional().
     });
   });
+
+  // week2d Part 3b — PlanSchema.inputs extraction coverage.
+  //
+  //   [6] valid inputs object → surfaced on return
+  //   [7] malformed inputs values (non-string, oversize) → soft-fail to
+  //        filtered Record<string, string> with log.warn
+  //   [8] absent inputs field → defaults to {} via schema .default
+
+  it("[6] week2d Part 3b: valid inputs object → surfaced on return output", async () => {
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reset password via skill card",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {
+          email: "jane@example.com",
+          ticket_id: "T-123",
+        },
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-123", subject: "Reset for jane" },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.inputs).toEqual({
+      email: "jane@example.com",
+      ticket_id: "T-123",
+    });
+  });
+
+  it("[7] week2d Part 3b: malformed inputs (non-string / oversize) → dropped entries + remainder preserved (soft-fail)", async () => {
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reset password",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {
+          email: "jane@example.com",           // valid
+          user_id: 42,                          // non-string → drop
+          note: "",                             // empty → drop
+          huge: "x".repeat(600),                // oversize (>500) → drop
+        },
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-1", subject: "Reset" },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    // Valid entry survives; the three malformed entries are silently
+    // dropped (log.warn emitted; tested via log capture in a future
+    // smoke hardening pass).
+    expect(result.inputs).toEqual({ email: "jane@example.com" });
+  });
+
+  it("[8] week2d Part 3b: absent inputs field → defaults to {} via PlanSchema.default({})", async () => {
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reset password",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        // inputs field omitted entirely
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-1", subject: "Reset" },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.inputs).toEqual({});
+  });
+
+  // week2e-dynamic-target-url — targetUrl override + reviewer-correction path.
+
+  it("[9] week2e: ticket.targetUrl surfaces in plan.targetUrl when Sonnet echoes it back (Path A+ happy)", async () => {
+    const TARGET = "https://customer-a-admin.example.com";
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reset on alternate portal",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {},
+        targetUrl: TARGET,
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-9", subject: "Reset on alt", targetUrl: TARGET },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.targetUrl).toBe(TARGET);
+  });
+
+  it("[10] week2e: ticket.targetUrl fallback when Sonnet omits targetUrl (soft-default)", async () => {
+    const TARGET = "https://customer-b-admin.example.com";
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reset; targetUrl omitted by model",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {},
+        // targetUrl omitted — fallback to ticket.targetUrl
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-10", subject: "Reset", targetUrl: TARGET },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.targetUrl).toBe(TARGET);
+  });
+
+  it("[11] week2e: Path A+ — Sonnet emits CORRECTED targetUrl (different from ticket); plan.targetUrl reflects the flip", async () => {
+    const TICKET_URL = "https://stale.example.com";
+    const CORRECTED = "https://customer-a-admin.example.com";
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Reviewer corrected URL in observations",
+        skillCardName: null,
+        actions: [
+          {
+            stepNumber: 1,
+            verb: "navigate",
+            target: "/login",
+            description: "Load login",
+          },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {},
+        // Sonnet emits the CORRECTED URL, not the ticket's stale one.
+        targetUrl: CORRECTED,
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-11", subject: "Reset", targetUrl: TICKET_URL },
+        priorObservations: [
+          "Reviewer note: the correct URL is " + CORRECTED + " — the ticket's URL is stale.",
+        ],
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.targetUrl).toBe(CORRECTED);
+    expect(result.targetUrl).not.toBe(TICKET_URL);
+  });
+
+  it("[12] week2e: malformed Sonnet targetUrl (non-http) → falls back to ticket.targetUrl + logs warn", async () => {
+    const TICKET_URL = "https://safe.example.com";
+    scriptedCalls.push({
+      text: JSON.stringify({
+        narrative: "Sonnet emitted bad URL",
+        skillCardName: null,
+        actions: [
+          { stepNumber: 1, verb: "navigate", target: "/x", description: "go" },
+        ],
+        destructive: true,
+        requiresContext: false,
+        inputs: {},
+        targetUrl: "file:///etc/passwd", // non-http; must be rejected
+      }),
+    });
+    const result = await withRunContext(
+      {
+        runId: RUN_ID,
+        bus: new EventBus({ ringBufferSize: 32 }),
+        ticket: { ticketId: "T-12", subject: "Reset", targetUrl: TICKET_URL },
+      },
+      () => runPlanStep(makeRetrievalInput()),
+    );
+    expect(result.targetUrl).toBe(TICKET_URL); // fallback kicked in
+  });
 });

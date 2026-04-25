@@ -87,6 +87,13 @@ function makeDryRun(domMatches: boolean, anomalies: string[] = []) {
     domMatches,
     anomalies,
     plan: makePlan(false, 5),
+    // week2d Part 2 — required DryRunSchema fields. Internal
+    // blockController `DryRunOutput` declares them optional so this
+    // type-checks against the stub contract; runtime callers get
+    // empty arrays / null, same as pre-ReAct dry_run output would on
+    // these fixtures.
+    actionTrace: [],
+    boundaryReached: null,
   };
 }
 
