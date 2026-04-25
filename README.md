@@ -179,7 +179,6 @@ Or use the dev container: **Reopen in Container** → VS Code attaches to `agent
 
 ## Action items outstanding
 
-- **Rotate the Hugging Face token** previously committed to `.env.example` as a literal value. The token is scrubbed in the file now but sat on disk in cleartext — revoke on HF Settings → Access Tokens before the repo is pushed publicly.
 - Week 2b + 2c development continues on top of `PLATFORM_PIVOT_POINT`. See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)`.
 
 ---
