@@ -146,14 +146,31 @@ git push origin vibe-coding-pivot
 
 ## Bring it up
 
+The `agent` container boots to `sleep infinity` by design (it doubles as a
+VS Code dev container), so after `docker compose up` you still need to
+launch the Hono server inside it. The `test-webapp` container runs
+`node server.js` as its CMD and needs no extra step.
+
 ```bash
 cp .env.example .env                # fill in ANTHROPIC_API_KEY + HF_TOKEN
 docker compose build                # first build is slow (Playwright + spaCy model)
 docker compose up -d --wait
 docker compose ps                   # 7 services should be healthy
 
-# Run the agent test suite (157 tests)
+# First run only: install agent deps into the agent-node-modules volume
+docker exec agent bash -lc 'cd /workspace/services/agent && npm install'
+
+# Sanity: run the agent test suite (tsc + vitest, ~234 tests)
 docker exec agent bash -lc 'cd /workspace/services/agent && npm run check'
+
+# Start the agent Hono server in the background (logs to /tmp/agent-dev.log)
+docker exec -d agent bash -lc \
+  'cd /workspace/services/agent && npm run dev > /tmp/agent-dev.log 2>&1'
+
+# Confirm it's listening (expect status:"ok" once qdrant + rag + postgres probe green)
+sleep 4 && curl -sS http://localhost:3001/healthz
+# Tail the boot log if something looks off:
+#   docker exec agent bash -lc 'tail -80 /tmp/agent-dev.log'
 
 # Kick a ticket in for a smoke run
 curl -sS -X POST http://localhost:3001/triage \
@@ -165,7 +182,9 @@ curl -sS -X POST http://localhost:3001/triage \
 open http://localhost:3000/agent/review/<runId>
 ```
 
-Or use the dev container: **Reopen in Container** → VS Code attaches to `agent`, Docker Compose brings up the rest.
+Or use the dev container: **Reopen in Container** → VS Code attaches to
+`agent`; then run `npm install && npm run dev` from the integrated terminal
+instead of the backgrounded `docker exec` above.
 
 ### Host-exposed ports
 

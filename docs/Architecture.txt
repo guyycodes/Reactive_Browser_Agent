@@ -401,7 +401,7 @@ Design invariants (both documented in `blockController.ts` docblock):
 ================================================================================
 
 This is the reusable primitive that lets an LLM step call tools in a loop.
-Right now it's applied to ONLY the `retrieve` step. Over time you'll apply
+Right now it's applied to the retrieve and dry_run steps. Over time you'll apply
 it to classify, plan, and verify too (per MASTER_PLAN §4.1).
 
                  createReActStep({ id, goal, tools, maxIterations })
