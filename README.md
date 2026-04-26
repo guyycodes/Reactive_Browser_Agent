@@ -2,7 +2,44 @@
 
 A **platform-pivotable substrate for human-in-the-loop agents**, populated as a tier-1 IT helpdesk triage tool that controls a real browser through human review gates. Every run is auditable, every destructive action is gated, and the whole substrate is designed to pivot to adjacent verticals (agentic code editor, LLM training data collection, generic HITL editor) with minimal rework.
 
-> 🎥 **Demo video coming soon** — a walkthrough of a live run (ticket → plan → human review → browser execution → verify → approve) will be embedded here.
+### 🎥 Demo walkthrough
+
+A live run: ticket → plan → human review → browser execution → verify → approve.
+
+<p align="center">
+  <a href="https://youtu.be/uL1zU4HvZgc">
+    <img
+      src="https://img.youtube.com/vi/uL1zU4HvZgc/maxresdefault.jpg"
+      alt="Watch the demo on YouTube"
+      width="720"
+    />
+  </a>
+  <br/>
+  <sub><a href="https://youtu.be/uL1zU4HvZgc">▶ Watch on YouTube</a></sub>
+</p>
+
+<details>
+<summary><b>Chapters</b></summary>
+
+| Time   | Section                                            |
+| ------ | -------------------------------------------------- |
+| `0:00` | Intro                                              |
+| `0:02` | Why I built it                                     |
+| `0:19` | What this tool is                                  |
+| `0:44` | Walkthrough overview — Tier-1 helpdesk agent       |
+| `0:58` | Surface area of the test app                       |
+| `1:46` | Kicking off the ticket                             |
+| `2:14` | The agent in action                                |
+| `3:25` | Agentic ReAct pattern                              |
+| `4:13` | Human-in-the-loop review                           |
+| `6:15` | Audit trail                                        |
+| `6:55` | Materialized skill-card artifact                   |
+| `7:50` | Retrospective                                      |
+| `8:40` | High-level agent architecture                      |
+| `9:40` | Retrospective part 2                               |
+| `10:54`| Pulling the repo from the git tag                  |
+
+</details>
 
 ---
 
@@ -23,7 +60,7 @@ Most agent frameworks optimize for autonomy. This one is built around the opposi
 
 **Week 2a complete — 157/157 tests green, PLATFORM_PIVOT_POINT tagged.**
 
-- ✅ Phase 0 — Docker Compose infrastructure + RAG embedding pipeline (self-patched HF model, per-document Qdrant collections via UUID filename convention)
+- ✅ Phase 0 — Docker Compose infrastructure + RAG embedding pipeline ([self-patched e5-large-v2 HF model](https://huggingface.co/guymorganb/e5-large-v2-4096-lsg-patched), per-document Qdrant collections via UUID filename convention) — design rationale: [Optimized Text Embeddings: Performance & Practical Applications](https://medium.com/@guyycodes/optimized-text-embeddings-performance-practical-applications-4812059a384c)
 - ✅ Week 1A — Envelope schema + EventBus + Anthropic streamMapper + reviewer UI scaffold
 - ✅ Week 1B — Real browser control (Playwright MCP) + real RAG retrieval + ReAct runner + Block 1 controller + pre-exec review gate + post-exec verify gate + refine-loop and backtrack-loop meta-loops
 - ✅ **Week 2a — ChatBar reviewer UI refactor + 4-decision HIL model + substrate pivot-point tagged**
@@ -199,6 +236,17 @@ instead of the backgrounded `docker exec` above.
 ## Action items outstanding
 
 - Week 2b + 2c development continues on top of `PLATFORM_PIVOT_POINT`. See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)`.
+
+---
+
+## Author
+
+**Morgan Beals** — business owner → engineer → builder.
+
+- [LinkedIn](https://www.linkedin.com/in/morgbeals/)
+- [Links & other projects (Widgetfied, etc.)](https://links.widgetfied.com/links/)
+- [Hugging Face — `e5-large-v2-4096-lsg-patched`](https://huggingface.co/guymorganb/e5-large-v2-4096-lsg-patched)
+- [Medium — Optimized Text Embeddings: Performance & Practical Applications](https://medium.com/@guyycodes/optimized-text-embeddings-performance-practical-applications-4812059a384c)
 
 ---
 
