@@ -58,16 +58,20 @@ Most agent frameworks optimize for autonomy. This one is built around the opposi
 
 ## Current status
 
-**Week 2a complete — 157/157 tests green, PLATFORM_PIVOT_POINT tagged.**
+**Week 2d Parts 0–3 complete — 234/234 tests green across 25 files, `tsc` clean, all four HIL paths smoked green.**
 
 - ✅ Phase 0 — Docker Compose infrastructure + RAG embedding pipeline ([self-patched e5-large-v2 HF model](https://huggingface.co/guymorganb/e5-large-v2-4096-lsg-patched), per-document Qdrant collections via UUID filename convention) — design rationale: [Optimized Text Embeddings: Performance & Practical Applications](https://medium.com/@guyycodes/optimized-text-embeddings-performance-practical-applications-4812059a384c)
 - ✅ Week 1A — Envelope schema + EventBus + Anthropic streamMapper + reviewer UI scaffold
 - ✅ Week 1B — Real browser control (Playwright MCP) + real RAG retrieval + ReAct runner + Block 1 controller + pre-exec review gate + post-exec verify gate + refine-loop and backtrack-loop meta-loops
-- ✅ **Week 2a — ChatBar reviewer UI refactor + 4-decision HIL model + substrate pivot-point tagged**
-- ⏳ Week 2b — skill-card schema + RAG wiring to replace hardcoded IT flows
-- ⏳ Week 2c — apply `createReActStep` to `classify` and `verify`
+- ✅ Week 2a — ChatBar reviewer UI refactor + 4-decision HIL model + substrate pivot-point tagged (`PLATFORM_PIVOT_POINT`)
+- ✅ Week 2b — YAML-driven skill-card runtime (`kb/skill_cards/`) replacing hardcoded IT flows, session-reuse probe + fallback, `executeSkillCardSteps` dispatcher
+- ✅ Week 2c — `createReActStep` applied to `classify`; verbosity pass (terse prompts + content-bearing observations + `retrieve` `maxIter=2`); `stepId`-attribution hotfix
+- ✅ **Week 2d Parts 0–3** — agentic `dry_run` via ReAct; **scaffold-vs-artifact** primitive (pre-authored skill cards are safety *scaffolds*; the executed *artifact* is materialized from the agent's actual action trace, stored in `ctx.tempSkillCard`, and persisted to the `materialized_skills` table); structured non-ReAct `verify` redesign with hard-fail guards; all four HIL paths smoked clean with zero forensic-fingerprint hits (P1 approve-only, P2 pre-exec edit refine, P3 post-exec reject backtrack, P4 pre-exec terminate)
+- ⏳ Week 2d Part 4 — reviewer-UI divergence banner + exhaustion `Approve`-disablement (pure UI commit)
+- ⏳ Week 2d Part 5 — `docs/Architecture.txt` §12 codification of scaffold/artifact primitive + 9→10-step workflow doc-sync + `MASTER_PLAN` progress rows for Parts 0–5
+- ⏳ Week 2e — ticket-level dynamic `targetUrl` injection (RFC in review) + reviewer top-bar ticket queue (design RFC pending)
 
-See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)` for the full progress table, forensic bug audit, and Week-2 polish queue.
+See `[docs/MASTER_PLAN.md](./docs/MASTER_PLAN.md)` for the full progress table, forensic bug audit, and polish queue; see `[docs/DESIGN-agentic-dry-run.md](./docs/DESIGN-agentic-dry-run.md)` for the Week-2d Part-0 design RFC that introduced the scaffold/artifact primitive.
 
 ---
 
